@@ -1,2 +1,2 @@
-# apila
-Agent harness for coding
+# Apila
+A general purpose agent harness for coding.
