@@ -1,0 +1,4 @@
+
+[env]
+RUST_BACKTRACE = "full"
+
