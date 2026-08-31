@@ -1,28 +1,61 @@
+use std::path::{Path, PathBuf};
+
 use ratatui::{
     crossterm::event::{self, Event, KeyCode, KeyEvent},
     layout::{Constraint, Layout, Rect},
     style::{Style, Stylize},
     symbols::border,
     text::{Line, Span},
-    widgets::Block,
+    widgets::{Block, Paragraph, Wrap},
     DefaultTerminal, Frame,
 };
 use thiserror::Error;
+
+use clap::Parser;
+
+#[derive(Debug, Parser)]
+#[command(version, about, long_about = None)]
+pub struct Args {
+    /// The project directory Apila uses to store data and create repositories in
+    #[arg(short, long)]
+    project_dir: String,
+}
 
 #[derive(Debug, Error)]
 pub enum TUIAppError {
     #[error("ratatui draw error")]
     RatatuiErr(#[from] std::io::Error),
+
+    #[error("invalid arg(s): {0}")]
+    InalidArgs(String),
 }
 
 #[derive(Debug)]
 pub struct TUIApp {
+    args: Args,
+    project_dir: PathBuf,
+
     exit: bool,
 }
 
 impl TUIApp {
-    pub fn new() -> TUIApp {
-        TUIApp { exit: false }
+    pub fn new(args: Args) -> Result<TUIApp, TUIAppError> {
+        // project_dir ////
+        let mut project_dir = PathBuf::new();
+        project_dir.push(args.project_dir.clone());
+
+        let project_path = Path::new(&project_dir);
+        if !project_path.is_dir() {
+            return Err(TUIAppError::InalidArgs(
+                "project_dir isn't a directory".to_string(),
+            ));
+        }
+
+        Ok(TUIApp {
+            args,
+            project_dir,
+            exit: false,
+        })
     }
 
     pub fn run(&mut self, term: &mut DefaultTerminal) -> Result<(), TUIAppError> {
@@ -70,7 +103,7 @@ impl TUIApp {
         let left_layout = Layout::vertical([Constraint::Length(10), Constraint::Fill(1)]);
         let [left_info_area, left_agents_area] = left_layout.areas(left_area);
 
-        if let Err(err) = self.render_status_area(left_info_area, frame) {
+        if let Err(err) = self.render_info_area(left_info_area, frame) {
             panic!("error: {}", err);
         }
         if let Err(err) = self.render_agents_area(left_agents_area, frame) {
@@ -83,12 +116,28 @@ impl TUIApp {
         frame.render_widget(block, frame.area())
     }
 
-    fn render_status_area(&self, area: Rect, frame: &mut Frame) -> Result<(), TUIAppError> {
+    fn render_info_area(&self, area: Rect, frame: &mut Frame) -> Result<(), TUIAppError> {
         let block = Block::bordered()
             .title(" Status ")
             .border_set(border::ROUNDED)
             .border_style(Style::default().cyan());
 
+        let info_items = vec![Line::from(vec![
+            "File: ".cyan(),
+            format!("{}", self.project_dir.to_string_lossy().to_string()).blue(),
+        ])];
+        let info_line_count = info_items.len() as u16;
+
+        let info_para = Paragraph::new(info_items).wrap(Wrap::default());
+
+        let info_block_layout = Layout::vertical([
+            Constraint::Length(info_line_count),
+            //Constraint::Length(1),
+            //Constraint::Fill(1),
+        ]);
+        let [info_para_area] = info_block_layout.areas(block.inner(area));
+
+        frame.render_widget(info_para, info_para_area);
         frame.render_widget(block, area);
         Ok(())
     }
