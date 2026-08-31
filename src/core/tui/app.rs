@@ -6,7 +6,7 @@ use ratatui::{
     style::{Style, Stylize},
     symbols::border,
     text::{Line, Span},
-    widgets::{Block, Paragraph, Wrap},
+    widgets::{Block, Padding, Paragraph, Wrap},
     DefaultTerminal, Frame,
 };
 use thiserror::Error;
@@ -86,14 +86,9 @@ impl TUIApp {
     }
 
     pub fn draw(&self, frame: &mut Frame) {
-        let title = Line::from(vec![Span::styled(
-            " Executing Queries ",
-            ratatui::style::Style::default().bold().cyan(),
-        )]);
-
         let instructions = Line::from(vec![" Quit ".into(), "<Q> ".blue().bold()]);
         let block = Block::default()
-            .title(title.centered())
+            .padding(Padding::top(1))
             .title_bottom(instructions.centered());
 
         let view_layout =
@@ -118,12 +113,12 @@ impl TUIApp {
 
     fn render_info_area(&self, area: Rect, frame: &mut Frame) -> Result<(), TUIAppError> {
         let block = Block::bordered()
-            .title(" Status ")
+            .title(" ✨Status ")
             .border_set(border::ROUNDED)
             .border_style(Style::default().cyan());
 
         let info_items = vec![Line::from(vec![
-            "File: ".cyan(),
+            "Project Dir: ".cyan(),
             format!("{}", self.project_dir.to_string_lossy().to_string()).blue(),
         ])];
         let info_line_count = info_items.len() as u16;
@@ -144,7 +139,7 @@ impl TUIApp {
 
     fn render_agents_area(&self, area: Rect, frame: &mut Frame) -> Result<(), TUIAppError> {
         let block = Block::bordered()
-            .title(" Agents ")
+            .title(" 🤖Agents ")
             .border_set(border::ROUNDED)
             .border_style(Style::default().cyan());
 
@@ -154,7 +149,7 @@ impl TUIApp {
 
     fn render_agent_detail_area(&self, area: Rect, frame: &mut Frame) -> Result<(), TUIAppError> {
         let block = Block::bordered()
-            .title(" Agent Memory ")
+            .title(" 🤖Agent Memory ")
             .border_set(border::ROUNDED)
             .border_style(Style::default().cyan());
 
