@@ -4,10 +4,10 @@ use crossterm::event::KeyModifiers;
 use ratatui::{
     crossterm::event::{self, Event, KeyCode, KeyEvent},
     layout::{Constraint, Layout, Rect},
-    style::{Style, Stylize},
+    style::{Color, Style, Stylize},
     symbols::border,
-    text::{Line, Span},
-    widgets::{Block, Cell, Padding, Paragraph, Row, Table, TableState, Wrap},
+    text::{Line, Span, Text},
+    widgets::{Block, Cell, HighlightSpacing, Padding, Paragraph, Row, Table, TableState, Wrap},
     DefaultTerminal, Frame,
 };
 use thiserror::Error;
@@ -216,6 +216,10 @@ impl TUIApp {
         let agent_definitions = self.rt.list_agents();
 
         // create table rows
+        let table_area = block.inner(area);
+        // the highlight symbol and the column spacing sit to the left of the cell
+        let detail_width = table_area.width.saturating_sub(2) as usize;
+
         let rows: Vec<Row> = agent_definitions
             .iter()
             .map(|agent_definition| {
@@ -227,26 +231,82 @@ impl TUIApp {
                 } else {
                     "●".dark_gray()
                 };
-                Row::new(vec![
-                    Cell::from(Line::from(indicator)),
-                    Cell::from(Line::from(vec![
-                        Span::from(config.name()).bold(),
+
+                // TODO: stubbed until the agent reports its real token usage
+                let context_used: u64 = 240_000;
+                let context_limit: u64 = 1_000_000;
+
+                Row::new(vec![Cell::from(vec![
+                    Line::from(vec![
+                        indicator,
                         Span::from(" "),
-                        config.model().full_slug().dark_gray(),
-                    ])),
-                ])
+                        Span::from(config.name()).bold().cyan(),
+                    ]),
+                    Line::from(vec![Span::from("  "), config.model().full_slug().into()]).cyan(),
+                    Self::context_usage_line(context_used, context_limit, detail_width),
+                ])])
+                .height(3)
             })
             .collect();
 
         // create and render table
-        let table_area = block.inner(area);
-        let table = Table::new(rows, [Constraint::Length(1), Constraint::Fill(1)])
+        let table = Table::new(rows, [Constraint::Fill(1)])
             .column_spacing(1)
-            .row_highlight_style(Style::default().on_dark_gray());
+            // subtle slate wash so the cyan row text stays readable
+            .row_highlight_style(Style::default().bg(Color::Rgb(45, 55, 72)))
+            .highlight_symbol(Text::from(vec![">".bold().cyan().into()]))
+            .highlight_spacing(HighlightSpacing::Always);
 
         frame.render_widget(block, area);
         frame.render_stateful_widget(table, table_area, &mut self.agents_table_state);
+
         Ok(())
+    }
+
+    /// Render a context window usage bar, e.g. "Context(24k/1M): ==>   2%".
+    /// The bar grows with usage and fills whatever width is left over.
+    fn context_usage_line(used: u64, limit: u64, width: usize) -> Line<'static> {
+        let fraction = if limit == 0 {
+            0.0
+        } else {
+            (used as f64 / limit as f64).clamp(0.0, 1.0)
+        };
+        let percent = (fraction * 100.0).round() as u64;
+
+        let label = format!(
+            "  Context({}/{}): ",
+            Self::human_tokens(used),
+            Self::human_tokens(limit)
+        );
+        let percent_text = format!(" {:>3}%", percent);
+
+        let bar_width = width
+            .saturating_sub(label.chars().count())
+            .saturating_sub(percent_text.chars().count());
+        // always show the ">" head for any non-zero usage
+        let filled = (((bar_width as f64) * fraction).round() as usize)
+            .max(if used > 0 { 1 } else { 0 })
+            .min(bar_width);
+        let bar = if filled == 0 {
+            String::new()
+        } else {
+            format!("{}>", "=".repeat(filled.saturating_sub(1)))
+        };
+
+        Line::from(vec![
+            Span::from(label).dark_gray(),
+            Span::from(format!("{:<bar_width$}", bar)).cyan(),
+            Span::from(percent_text).dark_gray(),
+        ])
+    }
+
+    /// Format a token count compactly: 950 -> "950", 24_000 -> "24k", 1_000_000 -> "1M"
+    fn human_tokens(tokens: u64) -> String {
+        match tokens {
+            t if t >= 1_000_000 => format!("{}M", t / 1_000_000),
+            t if t >= 1_000 => format!("{}k", t / 1_000),
+            t => t.to_string(),
+        }
     }
 
     fn render_agent_detail_area(
