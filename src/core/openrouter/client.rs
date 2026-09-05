@@ -36,7 +36,7 @@ pub struct OpenRouterConfig {
     api_key: String,
     base_url: String,
     http_referer: Option<String>,
-    x_title: Option<String>,
+    x_openrouter_title: Option<String>,
 }
 
 /// Hand written so the api key can never leak into a log or a panic message.
@@ -46,7 +46,7 @@ impl Debug for OpenRouterConfig {
             .field("api_key", &"<redacted>")
             .field("base_url", &self.base_url)
             .field("http_referer", &self.http_referer)
-            .field("x_title", &self.x_title)
+            .field("x_title", &self.x_openrouter_title)
             .finish()
     }
 }
@@ -57,7 +57,7 @@ impl OpenRouterConfig {
             api_key,
             base_url: DEFAULT_BASE_URL.into(),
             http_referer: None,
-            x_title: None,
+            x_openrouter_title: None,
         }
     }
 
@@ -70,7 +70,7 @@ impl OpenRouterConfig {
                 .clone()
                 .unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
             http_referer: config.http_referer.clone(),
-            x_title: config.x_title.clone(),
+            x_openrouter_title: config.x_openrouter_title.clone(),
         }
     }
 
@@ -80,8 +80,8 @@ impl OpenRouterConfig {
     pub fn http_referer(&self) -> Option<String> {
         self.http_referer.clone()
     }
-    pub fn x_title(&self) -> Option<String> {
-        self.x_title.clone()
+    pub fn x_openrouter_title(&self) -> Option<String> {
+        self.x_openrouter_title.clone()
     }
 
     pub fn set_base_url(mut self, base_url: String) -> OpenRouterConfig {
@@ -93,7 +93,7 @@ impl OpenRouterConfig {
         self
     }
     pub fn set_x_title(mut self, x_title: String) -> OpenRouterConfig {
-        self.x_title = Some(x_title);
+        self.x_openrouter_title = Some(x_title);
         self
     }
 }
@@ -145,8 +145,8 @@ impl OpenRouter {
         if let Some(http_referer) = &self.config.http_referer {
             builder = builder.header("HTTP-Referer", http_referer);
         }
-        if let Some(x_title) = &self.config.x_title {
-            builder = builder.header("X-Title", x_title);
+        if let Some(x_title) = &self.config.x_openrouter_title {
+            builder = builder.header("X-OpenRouter-Title", x_title);
         }
 
         let resp = builder.json(&req).send()?;

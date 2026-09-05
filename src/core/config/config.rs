@@ -41,7 +41,7 @@ pub struct Config {
     #[serde(default)]
     pub http_referer: Option<String>,
     #[serde(default)]
-    pub x_title: Option<String>,
+    pub x_openrouter_title: Option<String>,
 }
 
 /// Hand written so the api key can never leak into a log or a panic message.
@@ -52,7 +52,7 @@ impl std::fmt::Debug for Config {
             .field("openrouter_base_url", &self.openrouter_base_url)
             .field("default_model", &self.default_model)
             .field("http_referer", &self.http_referer)
-            .field("x_title", &self.x_title)
+            .field("x_openrouter_title", &self.x_openrouter_title)
             .finish()
     }
 }

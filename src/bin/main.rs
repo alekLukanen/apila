@@ -9,7 +9,13 @@ fn main() -> color_eyre::Result<()> {
 
     // the app is built before taking over the terminal so a startup failure,
     // like a missing config.json, prints normally
-    let mut app = tui::app::TUIApp::new(args)?;
+    let mut app = match tui::app::TUIApp::new(args) {
+        Ok(val) => val,
+        Err(val) => {
+            println!("err: {}", val);
+            return Ok(());
+        }
+    };
 
     let mut terminal = tui::utils::init()?;
     let result = app.run(&mut terminal).wrap_err("tui app failed");
