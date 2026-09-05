@@ -14,6 +14,7 @@ use thiserror::Error;
 
 use clap::Parser;
 
+use crate::core::config::config;
 use crate::core::runtime::{agent, runtime};
 
 #[derive(Debug, Parser)]
@@ -34,6 +35,9 @@ pub enum TUIAppError {
 
     #[error("runtime error: {0}")]
     RuntimeError(#[from] runtime::RuntimeError),
+
+    #[error("config error: {0}")]
+    ConfigError(#[from] config::ConfigError),
 }
 
 #[derive(Debug)]
@@ -59,7 +63,10 @@ impl TUIApp {
             ));
         }
 
-        let rt = runtime::Runtime::new(runtime::RuntimeConfig::new(project_dir.clone()));
+        // config.json ////
+        let cfg = config::Config::load(&project_dir)?;
+
+        let rt = runtime::Runtime::new(runtime::RuntimeConfig::new(project_dir.clone(), cfg))?;
 
         Ok(TUIApp {
             args,

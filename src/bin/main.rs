@@ -7,8 +7,11 @@ fn main() -> color_eyre::Result<()> {
 
     let args = tui::app::Args::parse();
 
-    let mut terminal = tui::utils::init()?;
+    // the app is built before taking over the terminal so a startup failure,
+    // like a missing config.json, prints normally
     let mut app = tui::app::TUIApp::new(args)?;
+
+    let mut terminal = tui::utils::init()?;
     let result = app.run(&mut terminal).wrap_err("tui app failed");
     if let Err(err) = tui::utils::restore() {
         eprintln!(
