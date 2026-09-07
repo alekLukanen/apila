@@ -1,8 +1,10 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crossterm::event::KeyModifiers;
 use ratatui::{
-    crossterm::event::{self, Event, KeyCode, KeyEvent},
+    crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind},
     layout::{Constraint, Layout, Rect},
     style::{Color, Style, Stylize},
     symbols::border,
@@ -15,7 +17,16 @@ use thiserror::Error;
 use clap::Parser;
 
 use crate::core::config::config;
+use crate::core::openrouter::types::Message;
+use crate::core::runtime::agent::{AgentDefinition, AgentState};
 use crate::core::runtime::{agent, runtime};
+
+/// How long the ui waits for a key before redrawing. Agents answer on
+/// background threads, so the screen has to refresh without any input.
+const TICK: Duration = Duration::from_millis(100);
+
+/// TODO: read the real context window off the model once it is available.
+const CONTEXT_LIMIT_TOKENS: u64 = 1_000_000;
 
 #[derive(Debug, Parser)]
 #[command(version, about, long_about = None)]
@@ -23,6 +34,12 @@ pub struct Args {
     /// The project directory Apila uses to store data and create repositories in
     #[arg(short, long)]
     project_dir: String,
+}
+
+impl Args {
+    pub fn new(project_dir: String) -> Args {
+        Args { project_dir }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -40,12 +57,26 @@ pub enum TUIAppError {
     ConfigError(#[from] config::ConfigError),
 }
 
+/// Where key presses go. The agent list drives everything until the user
+/// steps into an agent's chat.
+#[derive(Debug, PartialEq)]
+enum Focus {
+    Agents,
+    Chat,
+}
+
 #[derive(Debug)]
 pub struct TUIApp {
     args: Args,
     rt: runtime::Runtime,
 
     agents_table_state: TableState,
+    /// The half typed chat message for each agent.
+    chat_inputs: HashMap<String, String>,
+    /// True while typing into the selected agent's chat box.
+    chat_focused: bool,
+    /// Shown along the bottom of the detail window until the next key press.
+    status_message: Option<String>,
 
     exit: bool,
 }
@@ -66,12 +97,22 @@ impl TUIApp {
         // config.json ////
         let cfg = config::Config::load(&project_dir)?;
 
+        // agents come from the directories in the project directory, so the
+        // list is already populated before the first frame
         let rt = runtime::Runtime::new(runtime::RuntimeConfig::new(project_dir.clone(), cfg))?;
+
+        let mut agents_table_state = TableState::default();
+        if !rt.list_agents().is_empty() {
+            agents_table_state.select(Some(0));
+        }
 
         Ok(TUIApp {
             args,
             rt,
-            agents_table_state: TableState::default(),
+            agents_table_state,
+            chat_inputs: HashMap::new(),
+            chat_focused: false,
+            status_message: None,
             exit: false,
         })
     }
@@ -90,35 +131,105 @@ impl TUIApp {
         Ok(())
     }
 
+    // Input /////////////////////////////
+    //////////////////////////////////////
+
     fn handle_key_events(&mut self) -> Result<(), TUIAppError> {
-        match event::read()? {
-            Event::Key(KeyEvent {
-                code: KeyCode::Char('q'),
-                ..
-            }) => {
-                self.exit = true;
-            }
-            Event::Key(KeyEvent {
-                code: KeyCode::Char('n'),
+        // agents answer on their own threads; the wait has to time out so the
+        // screen keeps up with them
+        if !event::poll(TICK)? {
+            return Ok(());
+        }
+
+        let key = match event::read()? {
+            Event::Key(key) if key.kind == KeyEventKind::Press => key,
+            _ => return Ok(()),
+        };
+
+        self.status_message = None;
+
+        // always available, whatever has focus
+        match key {
+            KeyEvent {
+                code: KeyCode::Char('c'),
                 modifiers: KeyModifiers::CONTROL,
                 ..
-            }) => {
-                self.rt.create_agent(agent::AgentConfig::empty())?;
-                if self.agents_table_state.selected().is_none() {
-                    self.agents_table_state.select(Some(0));
+            } => {
+                self.exit = true;
+                return Ok(());
+            }
+            _ => {}
+        }
+
+        match self.focus() {
+            Focus::Agents => self.handle_agents_key(key),
+            Focus::Chat => self.handle_chat_key(key),
+        }
+    }
+
+    fn handle_agents_key(&mut self, key: KeyEvent) -> Result<(), TUIAppError> {
+        match key.code {
+            KeyCode::Char('q') => self.exit = true,
+            KeyCode::Down | KeyCode::Char('j') => self.select_agent_offset(1),
+            KeyCode::Up | KeyCode::Char('k') => self.select_agent_offset(-1),
+            KeyCode::Char('r') => self.reload_agents(),
+            KeyCode::Enter | KeyCode::Char('i') => self.open_selected_agent(),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// `<Enter>` on an agent runs it the first time and steps into its chat
+    /// from then on.
+    fn open_selected_agent(&mut self) {
+        let Some(definition) = self.selected_agent() else {
+            return;
+        };
+
+        if definition.state().started() {
+            self.chat_focused = true;
+            return;
+        }
+
+        match self.rt.start_agent(&definition.id()) {
+            Ok(_) => self.chat_focused = true,
+            Err(err) => self.status_message = Some(err.to_string()),
+        }
+    }
+
+    /// Picks up directories added or removed since the last load, and re-reads
+    /// the configuration files of every agent that hasn't started.
+    fn reload_agents(&mut self) {
+        self.rt.load_agents();
+        self.select_agent_offset(0);
+    }
+
+    fn handle_chat_key(&mut self, key: KeyEvent) -> Result<(), TUIAppError> {
+        let Some(id) = self.selected_agent_id() else {
+            return Ok(());
+        };
+
+        match key.code {
+            KeyCode::Esc => self.chat_focused = false,
+            KeyCode::Backspace => {
+                if let Some(input) = self.chat_inputs.get_mut(&id) {
+                    input.pop();
                 }
             }
-            Event::Key(KeyEvent {
-                code: KeyCode::Down | KeyCode::Char('j'),
-                ..
-            }) => {
-                self.select_agent_offset(1);
+            KeyCode::Enter => {
+                let content = self.chat_inputs.get(&id).cloned().unwrap_or_default();
+                if content.trim() == "" {
+                    return Ok(());
+                }
+                match self.rt.send_agent_message(&id, content) {
+                    Ok(_) => {
+                        self.chat_inputs.remove(&id);
+                    }
+                    Err(err) => self.status_message = Some(err.to_string()),
+                }
             }
-            Event::Key(KeyEvent {
-                code: KeyCode::Up | KeyCode::Char('k'),
-                ..
-            }) => {
-                self.select_agent_offset(-1);
+            KeyCode::Char(c) => {
+                self.chat_inputs.entry(id).or_default().push(c);
             }
             _ => {}
         }
@@ -140,26 +251,31 @@ impl TUIApp {
         self.agents_table_state.select(Some(selected as usize));
     }
 
-    pub fn draw(&mut self, frame: &mut Frame) {
-        let instruction_pairs = vec![
-            ("Quit", " <Q>"),
-            ("Create Agent", " <Ctrl+N>"),
-            ("Stop Agents", " <Ctrl+H>"),
-        ];
-        let num_instruction_pairs = instruction_pairs.len();
-        let instruction_items: Vec<Span> = instruction_pairs
-            .iter()
-            .enumerate()
-            .flat_map(|(idx, (title, code))| {
-                let mut spans = vec![Span::from(*title), code.blue().bold()];
-                if idx + 1 < num_instruction_pairs {
-                    spans.push(Span::from(" | "))
-                }
-                spans
-            })
-            .collect();
+    fn selected_agent(&self) -> Option<AgentDefinition> {
+        let selected = self.agents_table_state.selected()?;
+        self.rt.list_agents().into_iter().nth(selected)
+    }
 
-        let instructions = Line::from(instruction_items);
+    fn selected_agent_id(&self) -> Option<String> {
+        self.selected_agent().map(|agent| agent.id())
+    }
+
+    fn focus(&self) -> Focus {
+        let started = self
+            .selected_agent()
+            .is_some_and(|agent| agent.state().started());
+        if self.chat_focused && started {
+            Focus::Chat
+        } else {
+            Focus::Agents
+        }
+    }
+
+    // Rendering /////////////////////////
+    //////////////////////////////////////
+
+    pub fn draw(&mut self, frame: &mut Frame) {
+        let instructions = Line::from(Self::instruction_spans(self.focus(), self.enter_label()));
         let block = Block::default()
             .padding(Padding::top(1))
             .title_bottom(instructions.centered());
@@ -182,6 +298,55 @@ impl TUIApp {
         }
 
         frame.render_widget(block, frame.area())
+    }
+
+    /// What `<Enter>` does to the selected agent, for the key hints.
+    fn enter_label(&self) -> &'static str {
+        let Some(definition) = self.selected_agent() else {
+            return "Run Agent";
+        };
+        if definition.state().started() {
+            return "Chat";
+        }
+        // with no directive there is nothing to run it on yet
+        match definition.config_files() {
+            Some(files) if files.directive_file().present() => "Run Agent",
+            _ => "Open Chat",
+        }
+    }
+
+    /// The key hints along the bottom, which follow whatever has focus.
+    /// `enter_label` says what `<Enter>` does to the selected agent.
+    fn instruction_spans(focus: Focus, enter_label: &'static str) -> Vec<Span<'static>> {
+        let pairs: Vec<(&str, &str)> = match focus {
+            Focus::Agents => vec![
+                ("Quit", " <Q>"),
+                ("Move", " <↑/↓>"),
+                (enter_label, " <Enter>"),
+                ("Reload", " <R>"),
+            ],
+            Focus::Chat => vec![
+                ("Send", " <Enter>"),
+                ("Leave Chat", " <Esc>"),
+                ("Quit", " <Ctrl+C>"),
+            ],
+        };
+
+        let count = pairs.len();
+        pairs
+            .iter()
+            .enumerate()
+            .flat_map(|(idx, (title, code))| {
+                let mut spans = vec![
+                    Span::from(title.to_string()),
+                    code.to_string().blue().bold(),
+                ];
+                if idx + 1 < count {
+                    spans.push(Span::from(" | "))
+                }
+                spans
+            })
+            .collect()
     }
 
     fn render_info_area(&mut self, area: Rect, frame: &mut Frame) -> Result<(), TUIAppError> {
@@ -231,26 +396,24 @@ impl TUIApp {
             .iter()
             .map(|agent_definition| {
                 let config = agent_definition.config();
-                // TODO: use the agent's real state once it's tracked; active for now
-                let active = true;
-                let indicator = if active {
-                    "●".green()
-                } else {
-                    "●".dark_gray()
-                };
+                let state = agent_definition.state();
+                let indicator =
+                    Span::from("●").style(Style::default().fg(Self::state_color(&state)));
 
-                // TODO: stubbed until the agent reports its real token usage
-                let context_used: u64 = 240_000;
-                let context_limit: u64 = 1_000_000;
+                let context_used = agent_definition
+                    .usage()
+                    .map(|usage| usage.total_tokens as u64)
+                    .unwrap_or(0);
 
                 Row::new(vec![Cell::from(vec![
                     Line::from(vec![
                         indicator,
                         Span::from(" "),
                         Span::from(config.name()).bold().cyan(),
+                        Span::from(format!("  {}", state.label())).dark_gray(),
                     ]),
                     Line::from(vec![Span::from("  "), config.model().full_slug().into()]).cyan(),
-                    Self::context_usage_line(context_used, context_limit, detail_width),
+                    Self::context_usage_line(context_used, CONTEXT_LIMIT_TOKENS, detail_width),
                 ])])
                 .height(3)
             })
@@ -268,6 +431,16 @@ impl TUIApp {
         frame.render_stateful_widget(table, table_area, &mut self.agents_table_state);
 
         Ok(())
+    }
+
+    /// The color the status dot takes for each agent state.
+    fn state_color(state: &AgentState) -> Color {
+        match state {
+            AgentState::Configuring => Color::Yellow,
+            AgentState::Working => Color::Green,
+            AgentState::Idle => Color::Cyan,
+            AgentState::Failed(_) => Color::Red,
+        }
     }
 
     /// Render a context window usage bar, e.g. "Context(24k/1M): ==>   2%".
@@ -316,18 +489,281 @@ impl TUIApp {
         }
     }
 
+    /// The detail window. Everything about an agent lives here: its
+    /// configuration, the directory picker and configuration files it is set
+    /// up with, and the chat session once it is running.
     fn render_agent_detail_area(
         &mut self,
         area: Rect,
         frame: &mut Frame,
     ) -> Result<(), TUIAppError> {
         let block = Block::bordered()
-            .title(" 🤖Agent Memory ")
+            .title(" 🤖Agent ")
             .border_set(border::ROUNDED)
             .border_style(Style::default().cyan());
-
+        let inner = block.inner(area);
         frame.render_widget(block, area);
 
+        let Some(definition) = self.selected_agent() else {
+            let project_dir = self.rt.config().project_dir();
+            let hint = Paragraph::new(vec![
+                Line::from("No agents found.").dark_gray(),
+                Line::from(""),
+                Line::from(vec![
+                    Span::from("Agents are loaded from the directories in ").dark_gray(),
+                    Span::from(project_dir.to_string_lossy().to_string()).blue(),
+                    Span::from(". Add one with an ").dark_gray(),
+                    Span::from(agent::AGENTS_FILE_NAME).blue().bold(),
+                    Span::from(" file in it, then press ").dark_gray(),
+                    Span::from("<R>").blue().bold(),
+                    Span::from(" to reload.").dark_gray(),
+                ]),
+            ])
+            .wrap(Wrap::default());
+            frame.render_widget(hint, inner);
+            return Ok(());
+        };
+
+        let status_height = if self.status_message.is_some() { 2 } else { 0 };
+        let config_lines = self.config_lines(&definition);
+        let layout = Layout::vertical([
+            Constraint::Length(config_lines.len() as u16 + 1),
+            Constraint::Fill(1),
+            Constraint::Length(status_height),
+        ]);
+        let [config_area, body_area, status_area] = layout.areas(inner);
+
+        // render top info area
+        frame.render_widget(Paragraph::new(config_lines), config_area);
+
+        // render configuration or session
+        match definition.state() {
+            AgentState::Configuring => self.render_configuring(&definition, body_area, frame),
+            _ => self.render_session(&definition, body_area, frame),
+        }
+
+        // render status message
+        if let Some(status) = &self.status_message {
+            frame.render_widget(
+                Paragraph::new(Line::from(status.clone()).red()).wrap(Wrap::default()),
+                status_area,
+            );
+        }
+
         Ok(())
+    }
+
+    /// The agent's configuration, shown above whatever the detail window is
+    /// currently doing.
+    fn config_lines(&self, definition: &AgentDefinition) -> Vec<Line<'static>> {
+        let config = definition.config();
+        let dir = config.dir();
+        let dir_text = if dir.as_os_str().is_empty() {
+            "(not selected)".to_string()
+        } else {
+            dir.to_string_lossy().to_string()
+        };
+        let state = definition.state();
+
+        vec![
+            // the name is the directory the agent was loaded from, which is
+            // also its id, so there is nothing else worth putting here
+            Line::from(Span::from(config.name()).bold().cyan()),
+            Line::from(vec![
+                Span::from("Model:     ").dark_gray(),
+                Span::from(config.model().full_slug()).blue(),
+            ]),
+            Line::from(vec![
+                Span::from("Directory: ").dark_gray(),
+                Span::from(dir_text).blue(),
+            ]),
+            Line::from(vec![
+                Span::from("State:     ").dark_gray(),
+                Span::from(state.label()).style(Style::default().fg(Self::state_color(&state))),
+            ]),
+        ]
+    }
+
+    fn render_configuring(&mut self, definition: &AgentDefinition, area: Rect, frame: &mut Frame) {
+        let Some(config_files) = definition.config_files() else {
+            return;
+        };
+
+        let mut lines = vec![Line::from("Configuration files:").bold(), Line::from("")];
+        for file in config_files.files() {
+            // an optional file that isn't there is not a problem to fix, so it
+            // is dimmed rather than flagged
+            let (mark, style) = match (file.present(), file.required()) {
+                (true, _) => ("[✓]", Style::default().green()),
+                (false, true) => ("[ ]", Style::default().red()),
+                (false, false) => ("[-]", Style::default().dark_gray()),
+            };
+            let mut name = vec![
+                Span::from(mark).style(style),
+                Span::from(format!(" {}", file.name())).bold(),
+            ];
+            if !file.required() {
+                name.push(Span::from("  optional").dark_gray());
+            }
+            lines.push(Line::from(name));
+            lines.push(Line::from(format!("     {}", file.path().to_string_lossy())).dark_gray());
+        }
+
+        // a config.json that is present but unreadable says nothing on its own
+        if let Some(err) = config_files.settings_error() {
+            lines.push(Line::from(format!("     {}", err)).red());
+        }
+
+        lines.push(Line::from(""));
+        if config_files.complete() {
+            // the directive is what decides whether <Enter> starts the agent
+            // working or just opens the chat
+            let tail = if config_files.directive_file().present() {
+                " to run the agent on its directive."
+            } else {
+                " to open the chat. With no directive the agent starts on your first message."
+            };
+            lines.push(
+                Line::from(vec![
+                    Span::from("Ready. Press "),
+                    Span::from("<Enter>").blue().bold(),
+                    Span::from(tail),
+                ])
+                .green(),
+            );
+        } else {
+            lines.push(Line::from("Add the missing file(s), then press <R> to reload them.").red());
+        }
+
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap::default()), area);
+    }
+
+    /// The running agent's chat session: the transcript with an input box
+    /// underneath it.
+    fn render_session(&mut self, definition: &AgentDefinition, area: Rect, frame: &mut Frame) {
+        let layout = Layout::vertical([Constraint::Fill(1), Constraint::Length(3)]);
+        let [transcript_area, input_area] = layout.areas(area);
+
+        let width = transcript_area.width.max(1) as usize;
+        let mut lines: Vec<Line> = Vec::new();
+        for (idx, message) in definition.messages().iter().enumerate() {
+            // the opening turn can come from DIRECTIVE.md instead of the user
+            let directive = idx == 0 && definition.opened_with_directive();
+            lines.extend(Self::message_lines(message, width, directive));
+        }
+        if definition.state() == AgentState::Working {
+            lines.push(Line::from("…thinking").dark_gray().italic());
+        }
+        if let AgentState::Failed(err) = definition.state() {
+            lines.push(Line::from(format!("error: {}", err)).red());
+        }
+
+        // keep the newest output on screen
+        let height = transcript_area.height as usize;
+        let scroll = lines.len().saturating_sub(height) as u16;
+        frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), transcript_area);
+
+        let focused = self.focus() == Focus::Chat;
+        let input = self
+            .chat_inputs
+            .get(&definition.id())
+            .cloned()
+            .unwrap_or_default();
+        let input_block = Block::bordered()
+            .border_set(border::ROUNDED)
+            .border_style(if focused {
+                Style::default().cyan()
+            } else {
+                Style::default().dark_gray()
+            })
+            .title(if focused {
+                " message "
+            } else {
+                " <Enter> to chat "
+            });
+
+        let text = if focused {
+            Line::from(vec![Span::from(input), Span::from("▏").cyan()])
+        } else {
+            Line::from(input).dark_gray()
+        };
+        frame.render_widget(Paragraph::new(text).block(input_block), input_area);
+    }
+
+    /// One message rendered as a labeled block, hard wrapped to `width` so the
+    /// transcript can be scrolled by whole lines. `directive` marks the opening
+    /// turn that came out of `DIRECTIVE.md` rather than from the user.
+    fn message_lines(message: &Message, width: usize, directive: bool) -> Vec<Line<'static>> {
+        let (label, style) = match message {
+            Message::User { .. } if directive => ("directive", Style::default().yellow().bold()),
+            Message::User { .. } => ("you", Style::default().cyan().bold()),
+            Message::Assistant { .. } => ("agent", Style::default().green().bold()),
+            Message::Tool { .. } => ("tool", Style::default().magenta().bold()),
+            Message::System { .. } => ("system", Style::default().dark_gray().bold()),
+        };
+
+        let mut lines = vec![Line::from(Span::from(label).style(style))];
+        let content = message.content().unwrap_or("").to_string();
+        for line in Self::wrap(&content, width) {
+            lines.push(Line::from(line));
+        }
+        for call in message.tool_calls() {
+            lines.push(
+                Line::from(format!(
+                    "  → {}({})",
+                    call.function.name, call.function.arguments
+                ))
+                .dark_gray(),
+            );
+        }
+        lines.push(Line::from(""));
+        lines
+    }
+
+    /// The names of the agents in the list, for the tests.
+    #[cfg(test)]
+    pub fn agent_names_for_test(&self) -> Vec<String> {
+        self.rt
+            .list_agents()
+            .iter()
+            .map(|agent| agent.config().name())
+            .collect()
+    }
+
+    /// The selected agent's name, for the tests.
+    #[cfg(test)]
+    pub fn selected_agent_name_for_test(&self) -> Option<String> {
+        self.selected_agent().map(|agent| agent.config().name())
+    }
+
+    /// Drops the selected agent into a chat session, for the render tests.
+    #[cfg(test)]
+    pub fn seed_session_for_test(&mut self, opening: &str, assistant: &str, from_directive: bool) {
+        let id = self.selected_agent_id().expect("an agent is selected");
+        self.rt
+            .seed_session_for_test(&id, opening, assistant, from_directive);
+        self.chat_focused = true;
+        self.chat_inputs.insert(id, "a half typed reply".into());
+    }
+
+    /// Word wraps `text` to `width` columns, keeping the author's own line breaks.
+    fn wrap(text: &str, width: usize) -> Vec<String> {
+        let mut out = Vec::new();
+        for paragraph in text.split('\n') {
+            let mut current = String::new();
+            for word in paragraph.split_whitespace() {
+                if current.is_empty() {
+                    current = word.to_string();
+                } else if current.chars().count() + 1 + word.chars().count() <= width {
+                    current.push(' ');
+                    current.push_str(word);
+                } else {
+                    out.push(std::mem::take(&mut current));
+                    current = word.to_string();
+                }
+            }
+            out.push(current);
+        }
+        out
     }
 }

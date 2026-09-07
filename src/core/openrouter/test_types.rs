@@ -225,11 +225,17 @@ fn validate_rejects_bad_requests() {
     assert!(no_model.validate().is_err());
 
     let too_many_stops = ChatCompletionRequest::new("openai/gpt-4o", vec![Message::user("hi")])
-        .set_stop(vec!["a".into(), "b".into(), "c".into(), "d".into(), "e".into()]);
+        .set_stop(vec![
+            "a".into(),
+            "b".into(),
+            "c".into(),
+            "d".into(),
+            "e".into(),
+        ]);
     assert!(too_many_stops.validate().is_err());
 
-    let bad_temperature = ChatCompletionRequest::new("openai/gpt-4o", vec![Message::user("hi")])
-        .set_temperature(3.0);
+    let bad_temperature =
+        ChatCompletionRequest::new("openai/gpt-4o", vec![Message::user("hi")]).set_temperature(3.0);
     assert!(bad_temperature.validate().is_err());
 
     let bad_tool_name = ChatCompletionRequest::new("openai/gpt-4o", vec![Message::user("hi")])
@@ -241,4 +247,15 @@ fn validate_rejects_bad_requests() {
         .set_stop(vec!["\n\n".into()])
         .set_tools(vec![Tool::function("list_files", "ok", json!({}))]);
     assert!(ok.validate().is_ok());
+}
+
+#[test]
+fn validate_rejects_a_request_with_no_user_message() {
+    let req = ChatCompletionRequest::new("openai/gpt-4o", vec![Message::system("guidelines")]);
+
+    let err = req
+        .validate()
+        .expect_err("a system message is not a conversation");
+
+    assert!(err.contains("user message"));
 }

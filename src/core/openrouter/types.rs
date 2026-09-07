@@ -241,6 +241,15 @@ impl ChatCompletionRequest {
         if self.messages.is_empty() {
             return Err("messages must contain at least one message".into());
         }
+        // providers reject a conversation that never reaches a user turn, so
+        // it is caught here rather than by a 400
+        if !self
+            .messages
+            .iter()
+            .any(|message| matches!(message, Message::User { .. }))
+        {
+            return Err("messages must contain at least one user message".into());
+        }
         if let Some(stop) = &self.stop {
             if stop.len() > MAX_STOP_SEQUENCES {
                 return Err(format!(

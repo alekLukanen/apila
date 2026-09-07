@@ -18,7 +18,7 @@ fn load_reads_a_valid_config() {
         r#"{
             "openrouter_api_key": "sk-or-test",
             "default_model": "openai/gpt-4o",
-            "x_openroutere_title": "apila"
+            "x_openrouter_title": "apila"
         }"#,
     )
     .expect("write config");
