@@ -146,19 +146,22 @@ impl TUIApp {
             _ => return Ok(()),
         };
 
+        self.handle_key(key)
+    }
+
+    /// Acts on one key press, whichever window has focus.
+    pub fn handle_key(&mut self, key: KeyEvent) -> Result<(), TUIAppError> {
         self.status_message = None;
 
         // always available, whatever has focus
-        match key {
-            KeyEvent {
-                code: KeyCode::Char('c'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } => {
-                self.exit = true;
-                return Ok(());
-            }
-            _ => {}
+        if let KeyEvent {
+            code: KeyCode::Char('c'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        } = key
+        {
+            self.exit = true;
+            return Ok(());
         }
 
         match self.focus() {
@@ -718,32 +721,6 @@ impl TUIApp {
         }
         lines.push(Line::from(""));
         lines
-    }
-
-    /// The names of the agents in the list, for the tests.
-    #[cfg(test)]
-    pub fn agent_names_for_test(&self) -> Vec<String> {
-        self.rt
-            .list_agents()
-            .iter()
-            .map(|agent| agent.config().name())
-            .collect()
-    }
-
-    /// The selected agent's name, for the tests.
-    #[cfg(test)]
-    pub fn selected_agent_name_for_test(&self) -> Option<String> {
-        self.selected_agent().map(|agent| agent.config().name())
-    }
-
-    /// Drops the selected agent into a chat session, for the render tests.
-    #[cfg(test)]
-    pub fn seed_session_for_test(&mut self, opening: &str, assistant: &str, from_directive: bool) {
-        let id = self.selected_agent_id().expect("an agent is selected");
-        self.rt
-            .seed_session_for_test(&id, opening, assistant, from_directive);
-        self.chat_focused = true;
-        self.chat_inputs.insert(id, "a half typed reply".into());
     }
 
     /// Word wraps `text` to `width` columns, keeping the author's own line breaks.

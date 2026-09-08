@@ -293,37 +293,6 @@ impl Runtime {
         });
     }
 
-    /// Builds the opening request without sending it, for the tests.
-    #[cfg(test)]
-    pub fn start_request_for_test(
-        &self,
-        id: &str,
-    ) -> Result<Option<ChatCompletionRequest>, RuntimeError> {
-        self.start_request(id)
-    }
-
-    /// Puts the agent into a running session with a canned exchange, so the
-    /// session view can be rendered without touching the network.
-    #[cfg(test)]
-    pub fn seed_session_for_test(
-        &self,
-        id: &str,
-        opening: &str,
-        assistant: &str,
-        from_directive: bool,
-    ) {
-        let mut inner = self.inner.lock().expect("mutex error");
-        let agent = inner.agent_mut(id).expect("agent exists");
-        let definition = agent.definition_mut();
-        if from_directive {
-            definition.push_directive(opening);
-        } else {
-            definition.push_message(Message::user(opening));
-        }
-        definition.push_message(Message::assistant(assistant));
-        definition.set_state(AgentState::Idle);
-    }
-
     /// The system prompt is `SYSTEM.md` — the restrictions and general
     /// guidelines — followed by `AGENTS.md`, which is scoped to this agent's
     /// purpose and so sits below it.

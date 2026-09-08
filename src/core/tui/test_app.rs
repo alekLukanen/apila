@@ -1,23 +1,20 @@
-use std::{env, fs, path::PathBuf};
+use std::path::Path;
 
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{backend::TestBackend, Terminal};
+
+use crate::core::test_support::{
+    agent_dir, project_dir, project_with_server, wait_until, write_directive,
+};
 
 use super::app::{Args, TUIApp};
 
-fn project_dir(name: &str) -> PathBuf {
-    let dir = env::temp_dir().join(format!("apila-test-app-{}-{}", name, std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).expect("create project dir");
-    fs::write(
-        dir.join("config.json"),
-        r#"{"openrouter_api_key": "sk-or-test"}"#,
-    )
-    .expect("write config");
-    fs::write(dir.join("SYSTEM.md"), "guidelines").expect("write system file");
-    dir
+/// Presses a key, the way the event loop would.
+fn press(app: &mut TUIApp, code: KeyCode) {
+    app.handle_key(KeyEvent::from(code)).expect("handle key");
 }
 
-fn app(dir: &PathBuf) -> TUIApp {
+fn app(dir: &Path) -> TUIApp {
     TUIApp::new(Args::new(dir.to_string_lossy().to_string())).expect("build app")
 }
 
@@ -32,54 +29,63 @@ fn every_detail_screen_renders() {
     let mut empty = app(&dir);
     term.draw(|frame| empty.draw(frame)).expect("draw empty");
 
-    let agent_dir = dir.join("worker");
-    fs::create_dir_all(&agent_dir).expect("create agent dir");
-    fs::write(agent_dir.join("AGENTS.md"), "purpose").expect("write agents file");
-    fs::write(
-        agent_dir.join("config.json"),
-        r#"{"model": "openai/gpt-4o"}"#,
-    )
-    .expect("write agent config");
+    // a configured agent, drawn before it is started
+    let (dir, _server) = project_with_server(
+        "render-session",
+        "Here is the plan.\n\nIt wraps across several lines so the transcript \
+         has something long enough to fold.",
+    );
+    let worker = agent_dir(&dir, "worker", true);
+    write_directive(&worker, "Review the parser.\n");
 
-    // the agent is loaded from the directory, already selected and configured
     let mut app = app(&dir);
     term.draw(|frame| app.draw(frame))
         .expect("draw configuring");
 
-    app.seed_session_for_test(
-        "Review the parser.",
-        "Here is the plan.\n\nIt wraps across several lines so the transcript \
-         has something long enough to fold.",
-        true,
-    );
-    term.draw(|frame| app.draw(frame)).expect("draw session");
+    // <Enter> runs the agent and steps into its chat
+    press(&mut app, KeyCode::Enter);
+    wait_until("the agent's reply on screen", || {
+        term.draw(|frame| app.draw(frame)).expect("draw session");
+        format!("{}", term.backend()).contains("Here is the plan.")
+    });
+
+    // a half typed reply is drawn in the composer
+    for c in "a half typed reply".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    term.draw(|frame| app.draw(frame)).expect("draw composing");
 
     // an opening turn out of DIRECTIVE.md is not the user talking
     let screen = format!("{}", term.backend());
     assert!(screen.contains("directive"));
     assert!(!screen.contains("you"));
+    assert!(screen.contains("a half typed reply"));
 }
 
 #[test]
 fn agents_are_listed_without_the_user_doing_anything() {
     let dir = project_dir("auto-load");
     for name in ["builder", "reviewer"] {
-        let agent_dir = dir.join(name);
-        fs::create_dir_all(&agent_dir).expect("create agent dir");
-        fs::write(agent_dir.join("AGENTS.md"), "purpose").expect("write agents file");
-        fs::write(
-            agent_dir.join("config.json"),
-            r#"{"model": "openai/gpt-4o"}"#,
-        )
-        .expect("write agent config");
+        agent_dir(&dir, name, true);
     }
 
-    let app = app(&dir);
+    let mut term = Terminal::new(TestBackend::new(120, 40)).expect("terminal");
+    let mut app = app(&dir);
+    term.draw(|frame| app.draw(frame)).expect("draw list");
 
-    assert_eq!(app.agent_names_for_test(), vec!["builder", "reviewer"]);
-    // the first agent is selected, so the detail window has something to show
-    assert_eq!(
-        app.selected_agent_name_for_test().as_deref(),
-        Some("builder")
-    );
+    let screen = format!("{}", term.backend());
+    // the agent's row in the list, found by the status dot in front of it
+    let row = |name: &str| {
+        let marker = format!("\u{25cf} {}", name);
+        screen
+            .lines()
+            .find(|line| line.contains(&marker))
+            .unwrap_or_else(|| panic!("`{}` is in the list", name))
+            .to_string()
+    };
+
+    // both agents are listed, and the first is selected so the detail window
+    // has something to show
+    assert!(row("builder").contains(">\u{25cf} builder"));
+    assert!(!row("reviewer").contains('>'));
 }

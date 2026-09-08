@@ -1,55 +1,27 @@
-use std::{env, fs, path::PathBuf};
+use std::{fs, path::Path};
 
 use crate::core::config::config::Config;
 use crate::core::openrouter::types::Message;
 use crate::core::runtime::agent::{
-    AgentState, AGENTS_FILE_NAME, AGENT_CONFIG_FILE_NAME, DIRECTIVE_FILE_NAME, SYSTEM_FILE_NAME,
+    AgentState, AGENTS_FILE_NAME, AGENT_CONFIG_FILE_NAME, SYSTEM_FILE_NAME,
+};
+use crate::core::test_support::{
+    agent_dir, project_dir, project_with_server, wait_until, write_agent_config, write_directive,
 };
 
 use super::runtime::{Runtime, RuntimeConfig, RuntimeError};
 
-/// A project directory holding a config.json and a project level SYSTEM.md.
-fn project_dir(name: &str) -> PathBuf {
-    let dir = env::temp_dir().join(format!(
-        "apila-test-runtime-{}-{}",
-        name,
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).expect("create project dir");
-    fs::write(
-        dir.join("config.json"),
-        r#"{"openrouter_api_key": "sk-or-test", "default_model": "openai/gpt-4o"}"#,
-    )
-    .expect("write config");
-    fs::write(dir.join(SYSTEM_FILE_NAME), "guidelines").expect("write system file");
-    dir
-}
-
-/// Creates a fully configured agent directory inside `project`, unless
-/// `with_agents_file` says to leave out its AGENTS.md.
-fn agent_dir(project: &PathBuf, name: &str, with_agents_file: bool) -> PathBuf {
-    let dir = project.join(name);
-    fs::create_dir_all(&dir).expect("create agent dir");
-    if with_agents_file {
-        fs::write(dir.join(AGENTS_FILE_NAME), "purpose").expect("write agents file");
-    }
-    write_agent_config(&dir, "openai/gpt-4o");
-    dir
-}
-
-/// Writes an agent's config.json, naming the model it runs on.
-fn write_agent_config(dir: &PathBuf, model: &str) {
-    fs::write(
-        dir.join(AGENT_CONFIG_FILE_NAME),
-        format!(r#"{{"model": "{}"}}"#, model),
-    )
-    .expect("write agent config");
-}
-
-fn runtime(dir: &PathBuf) -> Runtime {
+fn runtime(dir: &Path) -> Runtime {
     let config = Config::load(dir).expect("load config");
-    Runtime::new(RuntimeConfig::new(dir.clone(), config)).expect("build runtime")
+    Runtime::new(RuntimeConfig::new(dir.to_path_buf(), config)).expect("build runtime")
+}
+
+/// Runs the agent and waits for the reply its directive asked for.
+fn start_and_wait(rt: &Runtime, id: &str) {
+    rt.start_agent(id).expect("start the agent");
+    wait_until("the agent's reply", || {
+        rt.agent(id).expect("agent exists").state() == AgentState::Idle
+    });
 }
 
 #[test]
@@ -160,19 +132,19 @@ fn reloading_drops_an_agent_whose_directory_is_gone() {
 
 #[test]
 fn reloading_keeps_a_running_agent_whose_directory_is_gone() {
-    let dir = project_dir("running");
-    agent_dir(&dir, "builder", true);
+    let (dir, _server) = project_with_server("running", "on it");
+    let builder = agent_dir(&dir, "builder", true);
+    write_directive(&builder, "Start work.\n");
 
     let rt = runtime(&dir);
-    rt.seed_session_for_test("builder", "start", "on it", false);
+    start_and_wait(&rt, "builder");
     fs::remove_dir_all(dir.join("builder")).expect("remove agent dir");
     rt.load_agents();
 
     // its session is still worth something even though the directory is gone
-    assert_eq!(
-        rt.agent("builder").expect("agent exists").state(),
-        AgentState::Idle
-    );
+    let agent = rt.agent("builder").expect("agent exists");
+    assert_eq!(agent.state(), AgentState::Idle);
+    assert_eq!(agent.messages().len(), 2);
 }
 
 #[test]
@@ -302,47 +274,48 @@ fn an_agent_cannot_run_with_an_unreadable_config_file() {
 
 #[test]
 fn a_directive_opens_the_conversation_as_a_user_turn() {
-    let dir = project_dir("directive");
+    let (dir, server) = project_with_server("directive", "Reading it now.");
     let builder = agent_dir(&dir, "builder", true);
     fs::write(builder.join(AGENTS_FILE_NAME), "You review code.").expect("write agents file");
-    fs::write(builder.join(DIRECTIVE_FILE_NAME), "Review the parser.\n")
-        .expect("write directive file");
+    write_directive(&builder, "Review the parser.\n");
 
     let rt = runtime(&dir);
-    let request = rt
-        .start_request_for_test("builder")
-        .expect("build the opening request")
-        .expect("the directive gives the agent something to send");
+    start_and_wait(&rt, "builder");
 
-    assert!(request.validate().is_ok());
-    assert_eq!(request.messages.len(), 2);
+    // what went out: a system prompt and the directive as the opening turn
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    let sent: serde_json::Value = serde_json::from_str(&requests[0]).expect("a json request");
+    let messages = sent["messages"].as_array().expect("messages were sent");
+    assert_eq!(messages.len(), 2);
 
     // SYSTEM.md and AGENTS.md are both the system prompt
-    let system = request.messages[0].content().expect("content");
-    assert!(matches!(request.messages[0], Message::System { .. }));
+    assert_eq!(messages[0]["role"], "system");
+    let system = messages[0]["content"].as_str().expect("content");
     assert!(system.contains("guidelines"));
     assert!(system.contains("You review code."));
 
     // the directive is the opening user turn, sent as written
-    assert!(matches!(request.messages[1], Message::User { .. }));
-    assert_eq!(
-        request.messages[1].content().expect("content"),
-        "Review the parser."
-    );
+    assert_eq!(messages[1]["role"], "user");
+    assert_eq!(messages[1]["content"], "Review the parser.");
+
+    // and it is the agent's own first turn, not something the user typed
+    let agent = rt.agent("builder").expect("agent exists");
+    assert!(agent.opened_with_directive());
+    assert!(matches!(agent.messages()[0], Message::User { .. }));
+    assert!(matches!(agent.messages()[1], Message::Assistant { .. }));
 }
 
 #[test]
 fn without_a_directive_the_agent_waits_for_the_user() {
-    let dir = project_dir("no-directive");
+    let (dir, server) = project_with_server("no-directive", "unused");
     agent_dir(&dir, "builder", true);
 
     let rt = runtime(&dir);
-    let request = rt
-        .start_request_for_test("builder")
-        .expect("ready the agent");
+    rt.start_agent("builder").expect("ready the agent");
 
     // nothing to send, so nothing is sent
-    assert!(request.is_none());
+    assert!(server.requests().is_empty());
 
     let agent = rt.agent("builder").expect("agent exists");
     assert_eq!(agent.state(), AgentState::Idle);
