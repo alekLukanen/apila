@@ -17,7 +17,6 @@ fn load_reads_a_valid_config() {
         dir.join("config.json"),
         r#"{
             "openrouter_api_key": "sk-or-test",
-            "default_model": "openai/gpt-4o",
             "x_openrouter_title": "apila"
         }"#,
     )
@@ -26,7 +25,6 @@ fn load_reads_a_valid_config() {
     let config = Config::load(&dir).expect("load config");
 
     assert_eq!(config.openrouter_api_key, "sk-or-test");
-    assert_eq!(config.default_model.as_deref(), Some("openai/gpt-4o"));
     assert_eq!(config.x_openrouter_title.as_deref(), Some("apila"));
     assert_eq!(config.openrouter_base_url, None);
     assert_eq!(config.http_referer, None);

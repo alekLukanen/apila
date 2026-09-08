@@ -33,10 +33,6 @@ pub struct Config {
     #[serde(default)]
     pub openrouter_base_url: Option<String>,
 
-    /// Model used for new agents when none is given. Ex: "openai/gpt-4o".
-    #[serde(default)]
-    pub default_model: Option<String>,
-
     /// OpenRouter attribution headers.
     #[serde(default)]
     pub http_referer: Option<String>,
@@ -50,7 +46,6 @@ impl std::fmt::Debug for Config {
         f.debug_struct("Config")
             .field("openrouter_api_key", &"<redacted>")
             .field("openrouter_base_url", &self.openrouter_base_url)
-            .field("default_model", &self.default_model)
             .field("http_referer", &self.http_referer)
             .field("x_openrouter_title", &self.x_openrouter_title)
             .finish()

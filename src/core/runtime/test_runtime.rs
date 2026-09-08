@@ -2,8 +2,9 @@ use std::{fs, path::Path};
 
 use crate::core::config::config::Config;
 use crate::core::openrouter::types::Message;
-use crate::core::runtime::agent::{
-    AgentState, AGENTS_FILE_NAME, AGENT_CONFIG_FILE_NAME, SYSTEM_FILE_NAME,
+use crate::core::runtime::agent::AgentState;
+use crate::core::runtime::agent_config::{
+    ConfigFilesError, AGENTS_FILE_NAME, AGENT_CONFIG_FILE_NAME, SYSTEM_FILE_NAME,
 };
 use crate::core::test_support::{
     agent_dir, project_dir, project_with_server, wait_until, write_agent_config, write_directive,
@@ -204,21 +205,55 @@ fn an_agent_runs_on_the_model_its_own_config_file_names() {
 }
 
 #[test]
-fn an_agent_without_a_usable_model_falls_back_to_the_project_default() {
-    let dir = project_dir("fallback-model");
+fn an_agent_without_a_usable_model_is_left_unconfigured() {
+    let dir = project_dir("unusable-model");
     let builder = agent_dir(&dir, "builder", true);
-    // not an "author/slug" id, so it cannot be used
+    // not an "author/slug" id, and there is no project default to fall back on
     write_agent_config(&builder, "gpt-4o");
 
     let rt = runtime(&dir);
+    let agent = rt.agent("builder").expect("agent exists");
 
+    assert!(agent.config_files().is_none());
+    assert!(!agent.config().model().valid());
+    assert!(matches!(
+        agent.config_error().expect("the config error was kept"),
+        ConfigFilesError::InvalidModel(model) if model == "gpt-4o"
+    ));
+
+    let err = rt
+        .start_agent("builder")
+        .expect_err("the model is unusable");
+    assert!(matches!(
+        err,
+        RuntimeError::ConfigFileUnreadable { name, .. } if name == AGENT_CONFIG_FILE_NAME
+    ));
+}
+
+#[test]
+fn an_agent_whose_config_file_appears_later_becomes_configured() {
+    let dir = project_dir("config-added");
+    let builder = agent_dir(&dir, "builder", true);
+    fs::remove_file(builder.join(AGENT_CONFIG_FILE_NAME)).expect("remove agent config");
+
+    let rt = runtime(&dir);
+    assert!(rt
+        .agent("builder")
+        .expect("agent exists")
+        .config_error()
+        .is_some());
+
+    write_agent_config(&builder, "anthropic/claude-opus-5");
+    assert!(rt
+        .reload_config_files("builder")
+        .expect("reload")
+        .complete());
+
+    let agent = rt.agent("builder").expect("agent exists");
+    assert!(agent.config_error().is_none());
     assert_eq!(
-        rt.agent("builder")
-            .expect("agent exists")
-            .config()
-            .model()
-            .full_slug(),
-        "openai/gpt-4o"
+        agent.config().model().full_slug(),
+        "anthropic/claude-opus-5"
     );
 }
 
@@ -229,6 +264,14 @@ fn an_agent_cannot_run_without_its_config_file() {
     fs::remove_file(builder.join(AGENT_CONFIG_FILE_NAME)).expect("remove agent config");
 
     let rt = runtime(&dir);
+    // it is still listed, so the user can see what it is waiting on
+    let agent = rt.agent("builder").expect("agent exists");
+    assert!(agent.config_files().is_none());
+    assert!(matches!(
+        agent.config_error().expect("the config error was kept"),
+        ConfigFilesError::Missing { .. }
+    ));
+
     let err = rt
         .start_agent("builder")
         .expect_err("the agent config file is missing");

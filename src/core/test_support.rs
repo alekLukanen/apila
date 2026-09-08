@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use std::{env, fs, thread};
 
 use crate::core::config::config::CONFIG_FILE_NAME;
-use crate::core::runtime::agent::{
+use crate::core::runtime::agent_config::{
     AGENTS_FILE_NAME, AGENT_CONFIG_FILE_NAME, DIRECTIVE_FILE_NAME, SYSTEM_FILE_NAME,
 };
 
@@ -158,10 +158,7 @@ fn write_project_config(dir: &Path, base_url: Option<&str>) {
     };
     fs::write(
         dir.join(CONFIG_FILE_NAME),
-        format!(
-            r#"{{"openrouter_api_key": "sk-or-test", "default_model": "{}"{}}}"#,
-            TEST_MODEL, base_url
-        ),
+        format!(r#"{{"openrouter_api_key": "sk-or-test"{}}}"#, base_url),
     )
     .expect("write config");
 }

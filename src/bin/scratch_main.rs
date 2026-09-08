@@ -8,9 +8,12 @@ use apila::core::{
     },
 };
 
+/// The model this smoke test runs on unless one is passed in.
+const SMOKE_TEST_MODEL: &str = "openai/gpt-4o-mini";
+
 /// A live smoke test for the OpenRouter client. Reads the api key from
 /// `<project_dir>/config.json`; pass the project dir as the first argument
-/// (defaults to ./test_env).
+/// (defaults to ./test_env) and the model as the second.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("--- scratch main ---");
 
@@ -19,11 +22,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "test_env".to_string())
         .into();
 
+    let model = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| SMOKE_TEST_MODEL.to_string());
+
     let config = Config::load(&project_dir)?;
-    let model = config
-        .default_model
-        .clone()
-        .unwrap_or_else(|| "openai/gpt-4o-mini".to_string());
     let client = OpenRouter::new(OpenRouterConfig::from_config(&config))?;
 
     // plain chat ////

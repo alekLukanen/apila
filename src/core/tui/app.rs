@@ -19,7 +19,7 @@ use clap::Parser;
 use crate::core::config::config;
 use crate::core::openrouter::types::Message;
 use crate::core::runtime::agent::{AgentDefinition, AgentState};
-use crate::core::runtime::{agent, runtime};
+use crate::core::runtime::{agent_config, runtime};
 
 /// How long the ui waits for a key before redrawing. Agents answer on
 /// background threads, so the screen has to refresh without any input.
@@ -415,7 +415,7 @@ impl TUIApp {
                         Span::from(config.name()).bold().cyan(),
                         Span::from(format!("  {}", state.label())).dark_gray(),
                     ]),
-                    Line::from(vec![Span::from("  "), config.model().full_slug().into()]).cyan(),
+                    Line::from(vec![Span::from("  "), config.model().label().into()]).cyan(),
                     Self::context_usage_line(context_used, CONTEXT_LIMIT_TOKENS, detail_width),
                 ])])
                 .height(3)
@@ -516,7 +516,7 @@ impl TUIApp {
                     Span::from("Agents are loaded from the directories in ").dark_gray(),
                     Span::from(project_dir.to_string_lossy().to_string()).blue(),
                     Span::from(". Add one with an ").dark_gray(),
-                    Span::from(agent::AGENTS_FILE_NAME).blue().bold(),
+                    Span::from(agent_config::AGENTS_FILE_NAME).blue().bold(),
                     Span::from(" file in it, then press ").dark_gray(),
                     Span::from("<R>").blue().bold(),
                     Span::from(" to reload.").dark_gray(),
@@ -574,7 +574,7 @@ impl TUIApp {
             Line::from(Span::from(config.name()).bold().cyan()),
             Line::from(vec![
                 Span::from("Model:     ").dark_gray(),
-                Span::from(config.model().full_slug()).blue(),
+                Span::from(config.model().label()).blue(),
             ]),
             Line::from(vec![
                 Span::from("Directory: ").dark_gray(),
@@ -588,7 +588,21 @@ impl TUIApp {
     }
 
     fn render_configuring(&mut self, definition: &AgentDefinition, area: Rect, frame: &mut Frame) {
+        // config.json is what the rest is read from, so when it cannot be
+        // loaded there is no checklist to show — only what went wrong with it
         let Some(config_files) = definition.config_files() else {
+            let lines = match definition.config_error() {
+                Some(err) => vec![
+                    Line::from(format!("[ ] {}", agent_config::AGENT_CONFIG_FILE_NAME))
+                        .bold()
+                        .red(),
+                    Line::from(format!("     {}", err)).red(),
+                    Line::from(""),
+                    Line::from("Fix it, then press <R> to reload.").red(),
+                ],
+                None => vec![Line::from("Not loaded yet.").dark_gray()],
+            };
+            frame.render_widget(Paragraph::new(lines).wrap(Wrap::default()), area);
             return;
         };
 
@@ -610,11 +624,6 @@ impl TUIApp {
             }
             lines.push(Line::from(name));
             lines.push(Line::from(format!("     {}", file.path().to_string_lossy())).dark_gray());
-        }
-
-        // a config.json that is present but unreadable says nothing on its own
-        if let Some(err) = config_files.settings_error() {
-            lines.push(Line::from(format!("     {}", err)).red());
         }
 
         lines.push(Line::from(""));

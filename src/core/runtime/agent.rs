@@ -1,24 +1,7 @@
-use std::{
-    fs,
-    path::{Path, PathBuf},
+use crate::core::{
+    openrouter::types::{Message, Usage},
+    runtime::agent_config::{AgentConfig, ConfigFiles, ConfigFilesError},
 };
-
-use serde::Deserialize;
-
-use crate::core::openrouter::types::{Message, Usage};
-
-/// The agent's own settings. Lives in the agent's directory, alongside the
-/// project's `config.json` but scoped to this one agent.
-pub const AGENT_CONFIG_FILE_NAME: &str = "config.json";
-/// The opening instruction an agent runs on. Optional: without it the agent
-/// waits for the user to type the first message. Lives in the agent's directory.
-pub const DIRECTIVE_FILE_NAME: &str = "DIRECTIVE.md";
-/// Describes what the agent is meant to accomplish. Lives in the agent's directory.
-pub const AGENTS_FILE_NAME: &str = "AGENTS.md";
-/// The system prompt. It sits one level above `AGENTS.md`, describing the
-/// agent's restrictions and general guidelines. Looked up in the agent's
-/// directory first, then in the project directory.
-pub const SYSTEM_FILE_NAME: &str = "SYSTEM.md";
 
 pub struct Agent {
     definition: AgentDefinition,
@@ -34,6 +17,7 @@ impl Agent {
                 config,
                 state: AgentState::Configuring,
                 config_files: None,
+                config_error: None,
                 system_prompt: String::new(),
                 messages: Vec::new(),
                 opened_with_directive: false,
@@ -62,6 +46,10 @@ pub struct AgentDefinition {
     // state
     state: AgentState,
     config_files: Option<ConfigFiles>,
+    /// Why the agent's `config.json` could not be loaded, when it could not.
+    /// Set instead of `config_files`, since without that file there is no
+    /// configuration to speak of.
+    config_error: Option<ConfigFilesError>,
     system_prompt: String,
     messages: Vec<Message>,
     /// Whether the first message came from `DIRECTIVE.md` rather than the user.
@@ -81,6 +69,11 @@ impl AgentDefinition {
     }
     pub fn config_files(&self) -> Option<ConfigFiles> {
         self.config_files.clone()
+    }
+    /// Why the configuration could not be read. Present exactly when
+    /// `config_files` is absent, once the agent has been loaded.
+    pub fn config_error(&self) -> Option<ConfigFilesError> {
+        self.config_error.clone()
     }
     pub fn system_prompt(&self) -> String {
         self.system_prompt.clone()
@@ -105,6 +98,13 @@ impl AgentDefinition {
     }
     pub fn set_config_files(&mut self, config_files: ConfigFiles) {
         self.config_files = Some(config_files);
+        self.config_error = None;
+    }
+    /// Records that the agent has no usable configuration, dropping whatever
+    /// was read before it: the files on disk no longer say what it holds.
+    pub fn set_config_error(&mut self, error: ConfigFilesError) {
+        self.config_files = None;
+        self.config_error = Some(error);
     }
     pub fn set_system_prompt(&mut self, system_prompt: String) {
         self.system_prompt = system_prompt;
@@ -162,228 +162,5 @@ impl AgentState {
             self,
             AgentState::Working | AgentState::Idle | AgentState::Failed(_)
         )
-    }
-}
-
-/// One of the files an agent is configured from.
-#[derive(Debug, Clone)]
-pub struct ConfigFile {
-    name: String,
-    path: PathBuf,
-    present: bool,
-    /// An optional file changes how the agent behaves when it is there, but
-    /// its absence never stops the agent from running.
-    required: bool,
-}
-
-impl ConfigFile {
-    pub fn name(&self) -> String {
-        self.name.clone()
-    }
-    pub fn path(&self) -> PathBuf {
-        self.path.clone()
-    }
-    pub fn present(&self) -> bool {
-        self.present
-    }
-    pub fn required(&self) -> bool {
-        self.required
-    }
-    /// The agent cannot run until this file shows up.
-    pub fn missing(&self) -> bool {
-        self.required && !self.present
-    }
-    pub fn contents(&self) -> Option<String> {
-        fs::read_to_string(&self.path).ok()
-    }
-}
-
-/// The contents of an agent's `config.json`. Fields added here in the future
-/// should default, so an older `config.json` keeps loading.
-#[derive(Debug, Clone, Deserialize)]
-pub struct AgentSettings {
-    /// The model the agent runs on. Ex: "openai/gpt-4o".
-    pub model: String,
-}
-
-/// The files an agent is configured from, and whether each one was found.
-#[derive(Debug, Clone)]
-pub struct ConfigFiles {
-    config_file: ConfigFile,
-    agents_file: ConfigFile,
-    system_file: ConfigFile,
-    directive_file: ConfigFile,
-
-    /// The parsed `config.json`, absent when the file is missing or bad.
-    settings: Option<AgentSettings>,
-    /// Why `config.json` could not be read, when it is there but unusable.
-    settings_error: Option<String>,
-}
-
-impl ConfigFiles {
-    /// Looks for `config.json`, `AGENTS.md`, `SYSTEM.md` and the optional
-    /// `DIRECTIVE.md` in `dir`, reading the settings out of `config.json`. The
-    /// system prompt is allowed to live in `project_dir` instead, so a single
-    /// one can be shared by every agent in the project.
-    pub fn load(dir: &Path, project_dir: &Path) -> ConfigFiles {
-        let config_path = dir.join(AGENT_CONFIG_FILE_NAME);
-        let config_file = ConfigFile {
-            name: AGENT_CONFIG_FILE_NAME.into(),
-            present: config_path.is_file(),
-            path: config_path,
-            required: true,
-        };
-
-        let (settings, settings_error) = match config_file.contents() {
-            Some(raw) => match serde_json::from_str::<AgentSettings>(&raw) {
-                Ok(settings) => (Some(settings), None),
-                Err(err) => (None, Some(err.to_string())),
-            },
-            None => (None, None),
-        };
-
-        let agents_path = dir.join(AGENTS_FILE_NAME);
-        let agents_file = ConfigFile {
-            name: AGENTS_FILE_NAME.into(),
-            present: agents_path.is_file(),
-            path: agents_path,
-            required: true,
-        };
-
-        let local_system_path = dir.join(SYSTEM_FILE_NAME);
-        let system_path = if local_system_path.is_file() {
-            local_system_path
-        } else {
-            project_dir.join(SYSTEM_FILE_NAME)
-        };
-        let system_file = ConfigFile {
-            name: SYSTEM_FILE_NAME.into(),
-            present: system_path.is_file(),
-            path: system_path,
-            required: true,
-        };
-
-        let directive_path = dir.join(DIRECTIVE_FILE_NAME);
-        let directive_file = ConfigFile {
-            name: DIRECTIVE_FILE_NAME.into(),
-            present: directive_path.is_file(),
-            path: directive_path,
-            required: false,
-        };
-
-        ConfigFiles {
-            config_file,
-            agents_file,
-            system_file,
-            directive_file,
-            settings,
-            settings_error,
-        }
-    }
-
-    pub fn config_file(&self) -> ConfigFile {
-        self.config_file.clone()
-    }
-    pub fn agents_file(&self) -> ConfigFile {
-        self.agents_file.clone()
-    }
-    pub fn system_file(&self) -> ConfigFile {
-        self.system_file.clone()
-    }
-    /// The optional opening instruction. Present means the agent starts on its
-    /// own; absent means it waits for the user's first message.
-    pub fn directive_file(&self) -> ConfigFile {
-        self.directive_file.clone()
-    }
-    /// The agent's own settings, once `config.json` has been read.
-    pub fn settings(&self) -> Option<AgentSettings> {
-        self.settings.clone()
-    }
-    pub fn settings_error(&self) -> Option<String> {
-        self.settings_error.clone()
-    }
-    pub fn files(&self) -> Vec<ConfigFile> {
-        vec![
-            self.config_file.clone(),
-            self.system_file.clone(),
-            self.agents_file.clone(),
-            self.directive_file.clone(),
-        ]
-    }
-    /// The first required file that isn't there, if any.
-    pub fn missing_file(&self) -> Option<ConfigFile> {
-        self.files().into_iter().find(|file| file.missing())
-    }
-    /// Every required file was found and `config.json` parsed, so the agent
-    /// can be run.
-    pub fn complete(&self) -> bool {
-        self.missing_file().is_none() && self.settings.is_some()
-    }
-}
-
-#[derive(Clone)]
-pub struct AgentConfig {
-    name: String,
-    model: Model,
-    dir: PathBuf,
-}
-
-impl AgentConfig {
-    pub fn empty() -> AgentConfig {
-        AgentConfig {
-            name: "".into(),
-            model: Model {
-                author: "".into(),
-                slug: "".into(),
-            },
-            dir: PathBuf::new(),
-        }
-    }
-    pub fn name(&self) -> String {
-        self.name.clone()
-    }
-    pub fn model(&self) -> Model {
-        self.model.clone()
-    }
-    /// The directory the agent works in, chosen by the user at creation time.
-    pub fn dir(&self) -> PathBuf {
-        self.dir.clone()
-    }
-    pub fn set_name(mut self, name: String) -> AgentConfig {
-        self.name = name;
-        self
-    }
-    pub fn set_model(mut self, model: Model) -> AgentConfig {
-        self.model = model;
-        self
-    }
-    pub fn set_dir(mut self, dir: PathBuf) -> AgentConfig {
-        self.dir = dir;
-        self
-    }
-}
-
-#[derive(Clone)]
-pub struct Model {
-    pub author: String, // ex: openai
-    pub slug: String,   // ex: gpt-4o
-}
-
-impl Model {
-    /// Splits an "author/slug" model id, as written in a `config.json`.
-    pub fn parse(full_slug: &str) -> Option<Model> {
-        match full_slug.split_once('/') {
-            Some((author, slug)) if !author.is_empty() && !slug.is_empty() => Some(Model {
-                author: author.to_string(),
-                slug: slug.to_string(),
-            }),
-            _ => None,
-        }
-    }
-    pub fn valid(&self) -> bool {
-        self.author != "" && self.slug != ""
-    }
-    pub fn full_slug(&self) -> String {
-        format!("{}/{}", self.author, self.slug)
     }
 }

@@ -7,18 +7,14 @@ use std::{
 
 use thiserror::Error;
 
-use crate::core::config::config::Config;
 use crate::core::openrouter::client::{OpenRouter, OpenRouterConfig, OpenRouterError};
 use crate::core::openrouter::types::{ChatCompletionRequest, Message};
-use crate::core::runtime::agent::{
-    Agent, AgentConfig, AgentDefinition, AgentState, ConfigFiles, Model,
-};
+use crate::core::runtime::agent::{Agent, AgentDefinition, AgentState};
+use crate::core::runtime::agent_config::{AgentConfig, Model};
+use crate::core::runtime::agent_config::{ConfigFiles, ConfigFilesError};
+use crate::core::{config::config::Config, runtime::agent_config};
 
 use super::agent;
-
-/// Model used for new agents when the config file doesn't name one.
-const FALLBACK_MODEL_AUTHOR: &str = "openai";
-const FALLBACK_MODEL_SLUG: &str = "gpt-5.6-sol";
 
 #[derive(Debug, Error)]
 pub enum RuntimeError {
@@ -33,6 +29,24 @@ pub enum RuntimeError {
 
     #[error("openrouter error: {0}")]
     OpenRouter(#[from] OpenRouterError),
+}
+
+/// An agent's `config.json` is required, so every way of failing to read it
+/// keeps the shape the ui already reports: the file is missing, or it is
+/// there and cannot be used.
+impl From<ConfigFilesError> for RuntimeError {
+    fn from(err: ConfigFilesError) -> RuntimeError {
+        match err {
+            ConfigFilesError::Missing { name, .. } => RuntimeError::ConfigFileMissing(name),
+            ConfigFilesError::Unreadable { name, error, .. } => {
+                RuntimeError::ConfigFileUnreadable { name, error }
+            }
+            err @ ConfigFilesError::InvalidModel(_) => RuntimeError::ConfigFileUnreadable {
+                name: agent_config::AGENT_CONFIG_FILE_NAME.into(),
+                error: err.to_string(),
+            },
+        }
+    }
 }
 
 pub struct Runtime {
@@ -130,33 +144,41 @@ impl Runtime {
         });
 
         for dir in dirs {
-            let config_files = ConfigFiles::load(&dir, &project_dir);
+            // an unusable config.json leaves the agent listed but unconfigured,
+            // so the user can see what to fix and reload
+            let loaded = ConfigFiles::load(&dir, &project_dir);
             let existing = inner
                 .agents
-                .iter_mut()
-                .find(|agent| agent.agent_definition().config().dir() == dir);
+                .iter()
+                .position(|agent| agent.agent_definition().config().dir() == dir);
 
-            let model = self.model_for(&config_files);
-
-            match existing {
-                Some(agent) => {
-                    let definition = agent.definition_mut();
+            let index = match existing {
+                Some(index) => {
                     // a running agent already read its files; re-reading them
                     // would say nothing about the session in flight
-                    if !definition.state().started() {
-                        definition.set_config(definition.config().set_model(model));
-                        definition.set_config_files(config_files);
+                    if inner.agents[index].agent_definition().state().started() {
+                        continue;
                     }
+                    index
                 }
                 None => {
                     let name = Self::dir_name(&dir);
-                    let config = AgentConfig::empty()
-                        .set_name(name.clone())
-                        .set_model(model)
-                        .set_dir(dir);
-                    let mut agent = Agent::new(name, config);
-                    agent.definition_mut().set_config_files(config_files);
-                    inner.agents.push(agent);
+                    let config = AgentConfig::empty().set_name(name.clone()).set_dir(dir);
+                    inner.agents.push(Agent::new(name, config));
+                    inner.agents.len() - 1
+                }
+            };
+
+            let definition = inner.agents[index].definition_mut();
+            match loaded {
+                Ok(config_files) => {
+                    definition.set_config(definition.config().set_model(config_files.model()));
+                    definition.set_config_files(config_files);
+                }
+                Err(err) => {
+                    // the model came out of the file that just failed to load
+                    definition.set_config(definition.config().set_model(Model::empty()));
+                    definition.set_config_error(err);
                 }
             }
         }
@@ -175,9 +197,16 @@ impl Runtime {
         let agent = inner.agent_mut(id)?;
         let definition = agent.definition_mut();
 
-        let config_files = ConfigFiles::load(&definition.config().dir(), &project_dir);
-        let model = Self::model_from(&config_files).unwrap_or_else(|| definition.config().model());
-        definition.set_config(definition.config().set_model(model));
+        let config_files = match ConfigFiles::load(&definition.config().dir(), &project_dir) {
+            Ok(config_files) => config_files,
+            Err(err) => {
+                definition.set_config(definition.config().set_model(Model::empty()));
+                definition.set_config_error(err.clone());
+                return Err(err.into());
+            }
+        };
+
+        definition.set_config(definition.config().set_model(config_files.model()));
         definition.set_config_files(config_files.clone());
 
         Ok(config_files)
@@ -204,17 +233,16 @@ impl Runtime {
             let agent = inner.agent_mut(id)?;
             let definition = agent.definition_mut();
 
+            // without a usable config.json the agent was never configured at
+            // all, so that failure is what to report
+            if let Some(err) = definition.config_error() {
+                return Err(err.into());
+            }
             let config_files = definition.config_files().ok_or_else(|| {
-                RuntimeError::ConfigFileMissing(agent::AGENT_CONFIG_FILE_NAME.into())
+                RuntimeError::ConfigFileMissing(agent_config::AGENT_CONFIG_FILE_NAME.into())
             })?;
             if let Some(file) = config_files.missing_file() {
                 return Err(RuntimeError::ConfigFileMissing(file.name()));
-            }
-            if let Some(error) = config_files.settings_error() {
-                return Err(RuntimeError::ConfigFileUnreadable {
-                    name: agent::AGENT_CONFIG_FILE_NAME.into(),
-                    error,
-                });
             }
 
             definition.set_system_prompt(Self::build_system_prompt(&config_files));
@@ -251,13 +279,6 @@ impl Runtime {
         self.request_response(id, request);
 
         Ok(())
-    }
-
-    fn chat_request(definition: &AgentDefinition) -> ChatCompletionRequest {
-        ChatCompletionRequest::new(
-            definition.config().model().full_slug(),
-            definition.request_messages(),
-        )
     }
 
     /// Runs the request on a background thread so the ui keeps drawing while
@@ -327,40 +348,17 @@ impl Runtime {
         dirs
     }
 
+    fn chat_request(definition: &AgentDefinition) -> ChatCompletionRequest {
+        ChatCompletionRequest::new(
+            definition.config().model().full_slug(),
+            definition.request_messages(),
+        )
+    }
+
     fn dir_name(dir: &Path) -> String {
         dir.file_name()
             .map(|name| name.to_string_lossy().to_string())
             .unwrap_or_default()
-    }
-
-    /// The model the agent runs on: whatever its own `config.json` names,
-    /// falling back to the project's default when it names nothing usable.
-    fn model_for(&self, config_files: &ConfigFiles) -> Model {
-        Self::model_from(config_files).unwrap_or_else(|| self.default_model())
-    }
-
-    /// The model named by an agent's `config.json`, if it parsed and holds a
-    /// usable "author/slug" id.
-    fn model_from(config_files: &ConfigFiles) -> Option<Model> {
-        config_files
-            .settings()
-            .and_then(|settings| Model::parse(&settings.model))
-    }
-
-    /// The model used when an agent's `config.json` names none, taken from the
-    /// project's config.json when it names one.
-    fn default_model(&self) -> Model {
-        let model = self
-            .config
-            .config()
-            .default_model
-            .as_deref()
-            .and_then(Model::parse);
-
-        model.unwrap_or(Model {
-            author: FALLBACK_MODEL_AUTHOR.into(),
-            slug: FALLBACK_MODEL_SLUG.into(),
-        })
     }
 
     pub fn list_agents(&self) -> Vec<AgentDefinition> {
