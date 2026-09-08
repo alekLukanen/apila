@@ -1,12 +1,12 @@
 use crate::core::openrouter::types::{Choice, FinishReason};
 
-enum Turn {
+pub(super) enum Turn {
     Continue,
     Done,
     Failed(String),
 }
 
-fn classify(choice: &Choice) -> Turn {
+pub(super) fn classify(choice: &Choice) -> Turn {
     if !choice.message.tool_calls().is_empty() {
         return Turn::Continue;
     }

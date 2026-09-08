@@ -2,17 +2,15 @@ use std::{
     fmt::Debug,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    thread,
 };
 
 use thiserror::Error;
 
+use crate::core::config::config::Config;
 use crate::core::openrouter::client::{OpenRouter, OpenRouterConfig, OpenRouterError};
-use crate::core::openrouter::types::{ChatCompletionRequest, Message};
-use crate::core::runtime::agent::{Agent, AgentDefinition, AgentState};
+use crate::core::runtime::agent::{Agent, AgentDefinition, AgentError};
 use crate::core::runtime::agent_config::{AgentConfig, Model};
 use crate::core::runtime::agent_config::{ConfigFiles, ConfigFilesError};
-use crate::core::{config::config::Config, runtime::agent_config};
 
 use super::agent;
 
@@ -36,15 +34,19 @@ pub enum RuntimeError {
 /// there and cannot be used.
 impl From<ConfigFilesError> for RuntimeError {
     fn from(err: ConfigFilesError) -> RuntimeError {
+        AgentError::from(err).into()
+    }
+}
+
+/// The agent reports the same configuration failures the runtime does, since
+/// they are the ones that stop it starting.
+impl From<AgentError> for RuntimeError {
+    fn from(err: AgentError) -> RuntimeError {
         match err {
-            ConfigFilesError::Missing { name, .. } => RuntimeError::ConfigFileMissing(name),
-            ConfigFilesError::Unreadable { name, error, .. } => {
+            AgentError::ConfigFileMissing(name) => RuntimeError::ConfigFileMissing(name),
+            AgentError::ConfigFileUnreadable { name, error } => {
                 RuntimeError::ConfigFileUnreadable { name, error }
             }
-            err @ ConfigFilesError::InvalidModel(_) => RuntimeError::ConfigFileUnreadable {
-                name: agent_config::AGENT_CONFIG_FILE_NAME.into(),
-                error: err.to_string(),
-            },
         }
     }
 }
@@ -66,9 +68,11 @@ struct RuntimeInner {
 }
 
 impl RuntimeInner {
-    fn agent_mut(&mut self, id: &str) -> Result<&mut agent::Agent, RuntimeError> {
+    /// Agents carry their own state behind their own lock, so a shared
+    /// reference is enough to talk to one.
+    fn agent(&self, id: &str) -> Result<&agent::Agent, RuntimeError> {
         self.agents
-            .iter_mut()
+            .iter()
             .find(|agent| agent.id() == id)
             .ok_or_else(|| RuntimeError::UnknownAgent(id.to_string()))
     }
@@ -164,20 +168,24 @@ impl Runtime {
                 None => {
                     let name = Self::dir_name(&dir);
                     let config = AgentConfig::empty().set_name(name.clone()).set_dir(dir);
-                    inner.agents.push(Agent::new(name, config));
+                    inner
+                        .agents
+                        .push(Agent::new(name, config, Arc::clone(&self.openrouter)));
                     inner.agents.len() - 1
                 }
             };
 
-            let definition = inner.agents[index].definition_mut();
+            let mut definition = inner.agents[index].definition();
             match loaded {
                 Ok(config_files) => {
-                    definition.set_config(definition.config().set_model(config_files.model()));
+                    let config = definition.config().set_model(config_files.model());
+                    definition.set_config(config);
                     definition.set_config_files(config_files);
                 }
                 Err(err) => {
                     // the model came out of the file that just failed to load
-                    definition.set_config(definition.config().set_model(Model::empty()));
+                    let config = definition.config().set_model(Model::empty());
+                    definition.set_config(config);
                     definition.set_config_error(err);
                 }
             }
@@ -193,139 +201,43 @@ impl Runtime {
     pub fn reload_config_files(&self, id: &str) -> Result<ConfigFiles, RuntimeError> {
         let project_dir = self.config.project_dir();
 
-        let mut inner = self.inner.lock().expect("mutex error");
-        let agent = inner.agent_mut(id)?;
-        let definition = agent.definition_mut();
+        let inner = self.inner.lock().expect("mutex error");
+        let mut definition = inner.agent(id)?.definition();
 
         let config_files = match ConfigFiles::load(&definition.config().dir(), &project_dir) {
             Ok(config_files) => config_files,
             Err(err) => {
-                definition.set_config(definition.config().set_model(Model::empty()));
+                let config = definition.config().set_model(Model::empty());
+                definition.set_config(config);
                 definition.set_config_error(err.clone());
                 return Err(err.into());
             }
         };
 
-        definition.set_config(definition.config().set_model(config_files.model()));
+        let config = definition.config().set_model(config_files.model());
+        definition.set_config(config);
         definition.set_config_files(config_files.clone());
 
         Ok(config_files)
     }
 
-    /// Starts the agent. With a `DIRECTIVE.md` it runs straight away on that
-    /// instruction; without one it waits for the user to type the first
-    /// message. Fails while any required configuration file is still missing.
+    /// Starts the agent, which from here on runs on its own thread. With a
+    /// `DIRECTIVE.md` it begins working straight away; without one it waits
+    /// for the user to type the first message. Fails while any required
+    /// configuration file is still missing.
     pub fn start_agent(&self, id: &str) -> Result<(), RuntimeError> {
-        if let Some(request) = self.start_request(id)? {
-            self.request_response(id, request);
-        }
-
+        let inner = self.inner.lock().expect("mutex error");
+        inner.agent(id)?.start()?;
         Ok(())
     }
 
-    /// Readies the agent and builds its opening request out of `DIRECTIVE.md`.
-    /// Returns `None` when the agent has no directive, leaving it idle with
-    /// nothing sent — a request holding only a system prompt is rejected by
-    /// the providers behind openrouter anyway.
-    fn start_request(&self, id: &str) -> Result<Option<ChatCompletionRequest>, RuntimeError> {
-        let request = {
-            let mut inner = self.inner.lock().expect("mutex error");
-            let agent = inner.agent_mut(id)?;
-            let definition = agent.definition_mut();
-
-            // without a usable config.json the agent was never configured at
-            // all, so that failure is what to report
-            if let Some(err) = definition.config_error() {
-                return Err(err.into());
-            }
-            let config_files = definition.config_files().ok_or_else(|| {
-                RuntimeError::ConfigFileMissing(agent_config::AGENT_CONFIG_FILE_NAME.into())
-            })?;
-            if let Some(file) = config_files.missing_file() {
-                return Err(RuntimeError::ConfigFileMissing(file.name()));
-            }
-
-            definition.set_system_prompt(Self::build_system_prompt(&config_files));
-
-            // without a directive there is nothing to say yet, so the agent
-            // goes idle and the user's first message opens the conversation
-            let Some(directive) = config_files.directive_file().contents() else {
-                definition.set_state(AgentState::Idle);
-                return Ok(None);
-            };
-
-            definition.push_directive(directive.trim());
-            definition.set_state(AgentState::Working);
-
-            Some(Self::chat_request(definition))
-        };
-
-        Ok(request)
-    }
-
-    /// Appends the user's message and asks the model for a response.
+    /// Hands the user's message to the agent. It answers on its own thread,
+    /// so this returns as soon as the agent has taken the message; one sent
+    /// while the agent is working is queued until it comes back around.
     pub fn send_agent_message(&self, id: &str, content: String) -> Result<(), RuntimeError> {
-        let request = {
-            let mut inner = self.inner.lock().expect("mutex error");
-            let agent = inner.agent_mut(id)?;
-            let definition = agent.definition_mut();
-
-            definition.push_message(Message::user(content));
-            definition.set_state(AgentState::Working);
-
-            Self::chat_request(definition)
-        };
-
-        self.request_response(id, request);
-
+        let inner = self.inner.lock().expect("mutex error");
+        inner.agent(id)?.send_message(content);
         Ok(())
-    }
-
-    /// Runs the request on a background thread so the ui keeps drawing while
-    /// it waits, recording the reply against the agent once it lands.
-    fn request_response(&self, id: &str, request: ChatCompletionRequest) {
-        let inner = Arc::clone(&self.inner);
-        let openrouter = Arc::clone(&self.openrouter);
-        let id = id.to_string();
-
-        thread::spawn(move || {
-            let result = openrouter.chat_completion(request);
-
-            let mut inner = inner.lock().expect("mutex error");
-            let agent = match inner.agent_mut(&id) {
-                Ok(agent) => agent,
-                // the agent was removed while the request was in flight
-                Err(_) => return,
-            };
-            let definition = agent.definition_mut();
-
-            match result {
-                Ok(resp) => {
-                    if let Some(choice) = resp.first_choice() {
-                        definition.push_message(choice.message.clone());
-                    }
-                    if let Some(usage) = resp.usage {
-                        definition.set_usage(usage);
-                    }
-                    definition.set_state(AgentState::Idle);
-                }
-                Err(err) => definition.set_state(AgentState::Failed(err.to_string())),
-            }
-        });
-    }
-
-    /// The system prompt is `SYSTEM.md` — the restrictions and general
-    /// guidelines — followed by `AGENTS.md`, which is scoped to this agent's
-    /// purpose and so sits below it.
-    fn build_system_prompt(config_files: &ConfigFiles) -> String {
-        let system = config_files.system_file().contents().unwrap_or_default();
-        let agents = config_files.agents_file().contents().unwrap_or_default();
-        format!(
-            "{}\n\n# Agent Purpose\n\nThe following describes the purpose of this \
-             specific agent. It is scoped by everything above.\n\n{}",
-            system.trim(),
-            agents.trim()
-        )
     }
 
     /// The directories in the project directory an agent is loaded from.
@@ -346,13 +258,6 @@ impl Runtime {
         };
         dirs.sort();
         dirs
-    }
-
-    fn chat_request(definition: &AgentDefinition) -> ChatCompletionRequest {
-        ChatCompletionRequest::new(
-            definition.config().model().full_slug(),
-            definition.request_messages(),
-        )
     }
 
     fn dir_name(dir: &Path) -> String {

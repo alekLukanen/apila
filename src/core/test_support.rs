@@ -36,6 +36,13 @@ impl StubOpenRouter {
     /// Starts the server on a loopback port of the operating system's
     /// choosing, replying to every request with `reply` as the assistant.
     pub fn start(reply: &str) -> StubOpenRouter {
+        StubOpenRouter::start_delayed(reply, Duration::ZERO)
+    }
+
+    /// The same server, holding each reply back by `delay`. Tests that need
+    /// an agent to still be working when they look at it use this, rather
+    /// than trying to catch a reply that has already landed.
+    pub fn start_delayed(reply: &str, delay: Duration) -> StubOpenRouter {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub openrouter");
         let addr = listener.local_addr().expect("stub openrouter address");
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -59,6 +66,7 @@ impl StubOpenRouter {
                 let Ok(mut stream) = stream else { break };
                 let request = read_request(&mut stream);
                 seen.lock().expect("mutex error").push(request);
+                thread::sleep(delay);
 
                 let _ = write!(
                     stream,
@@ -143,8 +151,18 @@ pub fn project_dir(name: &str) -> PathBuf {
 /// A project whose agents talk to a stub openrouter over loopback instead of
 /// the real one, for the tests that run an agent. Nothing leaves the machine.
 pub fn project_with_server(name: &str, reply: &str) -> (PathBuf, StubOpenRouter) {
+    project_with_delayed_server(name, reply, Duration::ZERO)
+}
+
+/// The same project, with a server that takes `delay` to answer, so a test
+/// can look at an agent while it is still working.
+pub fn project_with_delayed_server(
+    name: &str,
+    reply: &str,
+    delay: Duration,
+) -> (PathBuf, StubOpenRouter) {
     let dir = project_dir(name);
-    let server = StubOpenRouter::start(reply);
+    let server = StubOpenRouter::start_delayed(reply, delay);
     write_project_config(&dir, Some(&server.base_url()));
     (dir, server)
 }

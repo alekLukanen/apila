@@ -663,6 +663,16 @@ impl TUIApp {
             let directive = idx == 0 && definition.opened_with_directive();
             lines.extend(Self::message_lines(message, width, directive));
         }
+        // what the user typed mid turn is on its way but not in the
+        // conversation yet, so it is shown below what the agent is answering
+        for message in definition.queued_messages() {
+            lines.extend(Self::message_lines(message, width, false));
+            lines.push(
+                Line::from("  ↑ queued for the next turn")
+                    .dark_gray()
+                    .italic(),
+            );
+        }
         if definition.state() == AgentState::Working {
             lines.push(Line::from("…thinking").dark_gray().italic());
         }

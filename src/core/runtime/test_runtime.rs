@@ -1,4 +1,4 @@
-use std::{fs, path::Path};
+use std::{fs, path::Path, time::Duration};
 
 use crate::core::config::config::Config;
 use crate::core::openrouter::types::Message;
@@ -7,7 +7,8 @@ use crate::core::runtime::agent_config::{
     ConfigFilesError, AGENTS_FILE_NAME, AGENT_CONFIG_FILE_NAME, SYSTEM_FILE_NAME,
 };
 use crate::core::test_support::{
-    agent_dir, project_dir, project_with_server, wait_until, write_agent_config, write_directive,
+    agent_dir, project_dir, project_with_delayed_server, project_with_server, wait_until,
+    write_agent_config, write_directive,
 };
 
 use super::runtime::{Runtime, RuntimeConfig, RuntimeError};
@@ -382,4 +383,103 @@ fn a_missing_directive_never_stops_an_agent_running() {
     assert!(!config_files.directive_file().present());
     assert!(!config_files.directive_file().required());
     assert!(config_files.complete());
+}
+
+/// The messages of a request body the stub server was sent.
+fn sent_messages(request: &str) -> Vec<serde_json::Value> {
+    let sent: serde_json::Value = serde_json::from_str(request).expect("a json request");
+    sent["messages"]
+        .as_array()
+        .expect("messages were sent")
+        .clone()
+}
+
+#[test]
+fn a_message_sent_to_an_idle_agent_opens_the_conversation() {
+    let (dir, server) = project_with_server("first-message", "on it");
+    agent_dir(&dir, "builder", true);
+
+    let rt = runtime(&dir);
+    rt.start_agent("builder").expect("ready the agent");
+    rt.send_agent_message("builder", "Review the parser.".into())
+        .expect("send the message");
+    wait_until("the agent's reply", || {
+        rt.agent("builder").expect("agent exists").state() == AgentState::Idle
+    });
+
+    let messages = sent_messages(&server.requests()[0]);
+    assert_eq!(
+        messages.last().expect("a user turn")["content"],
+        "Review the parser."
+    );
+
+    let agent = rt.agent("builder").expect("agent exists");
+    assert!(!agent.opened_with_directive());
+    assert_eq!(agent.messages().len(), 2);
+}
+
+/// The agent answers on its own thread, so a message sent mid turn cannot go
+/// out with the request already in flight. It waits instead of being dropped.
+#[test]
+fn a_message_sent_while_the_agent_is_working_is_queued_for_the_next_turn() {
+    let (dir, server) =
+        project_with_delayed_server("queued-message", "on it", Duration::from_millis(200));
+    let builder = agent_dir(&dir, "builder", true);
+    write_directive(&builder, "Review the parser.\n");
+
+    let rt = runtime(&dir);
+    rt.start_agent("builder").expect("start the agent");
+    wait_until("the directive to go out", || server.requests().len() == 1);
+
+    rt.send_agent_message("builder", "Check the lexer too.".into())
+        .expect("send the message");
+
+    // the turn in flight is left alone and the message waits its turn
+    let agent = rt.agent("builder").expect("agent exists");
+    assert_eq!(agent.state(), AgentState::Working);
+    assert_eq!(agent.queued_messages().len(), 1);
+
+    wait_until("the agent's replies", || {
+        rt.agent("builder").expect("agent exists").state() == AgentState::Idle
+    });
+
+    // the directive and its reply, then the queued message and its reply
+    let agent = rt.agent("builder").expect("agent exists");
+    assert!(agent.queued_messages().is_empty());
+    assert_eq!(agent.messages().len(), 4);
+    assert!(matches!(agent.messages()[2], Message::User { .. }));
+
+    // and it went out as a turn of its own, on top of the conversation so far
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    let messages = sent_messages(&requests[1]);
+    assert_eq!(messages.len(), 4);
+    assert_eq!(
+        messages.last().expect("a user turn")["content"],
+        "Check the lexer too."
+    );
+}
+
+/// The thread belongs to the agent rather than to a single request, so the
+/// conversation carries on across turns.
+#[test]
+fn an_agent_keeps_answering_across_turns() {
+    let (dir, _server) = project_with_server("many-turns", "on it");
+    agent_dir(&dir, "builder", true);
+
+    let rt = runtime(&dir);
+    rt.start_agent("builder").expect("ready the agent");
+
+    for turn in 0..3 {
+        rt.send_agent_message("builder", format!("message {}", turn))
+            .expect("send the message");
+        wait_until("the agent's reply", || {
+            rt.agent("builder").expect("agent exists").state() == AgentState::Idle
+        });
+    }
+
+    assert_eq!(
+        rt.agent("builder").expect("agent exists").messages().len(),
+        6
+    );
 }
