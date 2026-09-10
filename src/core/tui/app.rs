@@ -28,6 +28,10 @@ const TICK: Duration = Duration::from_millis(100);
 /// TODO: read the real context window off the model once it is available.
 const CONTEXT_LIMIT_TOKENS: u64 = 1_000_000;
 
+/// How much of a tool's output the transcript shows before it says how much
+/// more there was. The model still gets all of it.
+const TOOL_OUTPUT_LINES: usize = 12;
+
 #[derive(Debug, Parser)]
 #[command(version, about, long_about = None)]
 pub struct Args {
@@ -567,6 +571,14 @@ impl TUIApp {
             dir.to_string_lossy().to_string()
         };
         let state = definition.state();
+        // an agent whose config.json failed to load has no tools at all, which
+        // says more than an empty list
+        let names = definition.tools().names();
+        let tools = if names.is_empty() {
+            "(none)".to_string()
+        } else {
+            names.join(", ")
+        };
 
         vec![
             // the name is the directory the agent was loaded from, which is
@@ -579,6 +591,14 @@ impl TUIApp {
             Line::from(vec![
                 Span::from("Directory: ").dark_gray(),
                 Span::from(dir_text).blue(),
+            ]),
+            Line::from(vec![
+                Span::from("Max iters: ").dark_gray(),
+                Span::from(config.max_iterations().to_string()).blue(),
+            ]),
+            Line::from(vec![
+                Span::from("Tools:     ").dark_gray(),
+                Span::from(tools).blue(),
             ]),
             Line::from(vec![
                 Span::from("State:     ").dark_gray(),
@@ -726,20 +746,54 @@ impl TUIApp {
 
         let mut lines = vec![Line::from(Span::from(label).style(style))];
         let content = message.content().unwrap_or("").to_string();
-        for line in Self::wrap(&content, width) {
-            lines.push(Line::from(line));
+
+        let wrapped = Self::wrap(&content, width);
+        // a command that printed thousands of lines would otherwise bury the
+        // conversation it belongs to. the whole of it is still what went to the
+        // model; this is only what is on screen
+        let shown = match message {
+            Message::Tool { .. } => TOOL_OUTPUT_LINES.min(wrapped.len()),
+            _ => wrapped.len(),
+        };
+        for line in wrapped.iter().take(shown) {
+            lines.push(Line::from(line.clone()));
         }
+        if shown < wrapped.len() {
+            lines.push(
+                Line::from(format!("  … {} more lines", wrapped.len() - shown))
+                    .dark_gray()
+                    .italic(),
+            );
+        }
+
         for call in message.tool_calls() {
+            // a command with a newline in it would otherwise break the layout,
+            // so the arguments are kept to the one line they are shown on
             lines.push(
                 Line::from(format!(
                     "  → {}({})",
-                    call.function.name, call.function.arguments
+                    call.function.name,
+                    Self::one_line(&call.function.arguments, width.saturating_sub(6))
                 ))
                 .dark_gray(),
             );
         }
         lines.push(Line::from(""));
         lines
+    }
+
+    /// `text` on a single line, cut to `width` with an ellipsis when it does
+    /// not fit.
+    fn one_line(text: &str, width: usize) -> String {
+        let flattened: String = text
+            .chars()
+            .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+            .collect();
+        if flattened.chars().count() <= width {
+            return flattened;
+        }
+        let kept: String = flattened.chars().take(width.saturating_sub(1)).collect();
+        format!("{}…", kept)
     }
 
     /// Word wraps `text` to `width` columns, keeping the author's own line breaks.

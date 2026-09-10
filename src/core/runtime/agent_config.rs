@@ -19,11 +19,17 @@ pub const AGENTS_FILE_NAME: &str = "AGENTS.md";
 /// directory first, then in the project directory.
 pub const SYSTEM_FILE_NAME: &str = "SYSTEM.md";
 
+/// The iteration bound of an agent that has not read its `config.json` yet.
+/// Every started agent overwrites it from its own settings, which are required
+/// to name one; this exists so an unconfigured config is never a trap.
+pub const DEFAULT_MAX_ITERATIONS: u32 = 10;
+
 #[derive(Clone)]
 pub struct AgentConfig {
     name: String,
     model: Model,
     dir: PathBuf,
+    max_iterations: u32,
 }
 
 impl AgentConfig {
@@ -32,6 +38,7 @@ impl AgentConfig {
             name: "".into(),
             model: Model::empty(),
             dir: PathBuf::new(),
+            max_iterations: DEFAULT_MAX_ITERATIONS,
         }
     }
     pub fn name(&self) -> String {
@@ -44,6 +51,10 @@ impl AgentConfig {
     pub fn dir(&self) -> PathBuf {
         self.dir.clone()
     }
+    /// The most requests the agent may make to the model in a single turn.
+    pub fn max_iterations(&self) -> u32 {
+        self.max_iterations
+    }
     pub fn set_name(mut self, name: String) -> AgentConfig {
         self.name = name;
         self
@@ -55,6 +66,26 @@ impl AgentConfig {
     pub fn set_dir(mut self, dir: PathBuf) -> AgentConfig {
         self.dir = dir;
         self
+    }
+    pub fn set_max_iterations(mut self, max_iterations: u32) -> AgentConfig {
+        self.max_iterations = max_iterations;
+        self
+    }
+
+    /// Everything the agent's `config.json` decides, moved onto the config the
+    /// runtime holds, so a setting added to the file is wired through in one
+    /// place rather than at every call site that reloads an agent.
+    pub fn set_from_config_files(self, config_files: &ConfigFiles) -> AgentConfig {
+        self.set_model(config_files.model())
+            .set_max_iterations(config_files.agent_max_iterations())
+    }
+
+    /// What the agent runs with when its `config.json` could not be read. The
+    /// file that named the model and the bound is the one that just failed, so
+    /// neither is kept.
+    pub fn clear_settings(self) -> AgentConfig {
+        self.set_model(Model::empty())
+            .set_max_iterations(DEFAULT_MAX_ITERATIONS)
     }
 }
 
@@ -133,12 +164,62 @@ impl ConfigFile {
     }
 }
 
-/// The contents of an agent's `config.json`. Fields added here in the future
-/// should default, so an older `config.json` keeps loading.
+/// The contents of an agent's `config.json`.
+///
+/// `model` and `agent_max_iterations` are required: neither has a project wide
+/// default, and an agent that loops without a bound is worse than one that
+/// refuses to start. `tools` defaults to nothing, so an agent has to ask before
+/// it can run commands.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AgentSettings {
     /// The model the agent runs on. Ex: "openai/gpt-4o".
     pub model: String,
+
+    /// The most requests the agent may make to the model in a single turn
+    /// before it gives up. Every tool call the model makes costs one, so this
+    /// is the ceiling on what one turn can cost.
+    pub agent_max_iterations: u32,
+
+    #[serde(default)]
+    pub tools: ToolSettings,
+}
+
+/// Which tools an agent may call and how each one is set up.
+///
+/// Kept as its own block, and each tool's settings kept as its own json, so
+/// registering a new tool never means adding a field here.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolSettings {
+    /// The tools the agent may call, named as the tool names itself. Tools that
+    /// are part of how a turn works — `end_turn` — are on regardless and need
+    /// not be listed.
+    #[serde(default)]
+    pub enabled: Vec<String>,
+
+    /// Per tool settings. Each entry names its tool and carries whatever that
+    /// tool understands; nothing here reads the settings themselves, which is
+    /// what lets a tool add one without this file changing.
+    #[serde(default)]
+    pub configs: Vec<ToolConfig>,
+}
+
+/// One tool's settings, out of an agent's `tools.configs`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ToolConfig {
+    /// The tool these settings belong to.
+    pub tool: String,
+
+    /// Everything written alongside it, handed to that tool untouched.
+    #[serde(flatten)]
+    pub settings: serde_json::Map<String, serde_json::Value>,
+}
+
+impl ToolConfig {
+    /// The settings as the tool reads them: a json object, never anything else.
+    pub fn settings_value(&self) -> serde_json::Value {
+        serde_json::Value::Object(self.settings.clone())
+    }
 }
 
 /// Why an agent's `config.json` could not be turned into settings. Every one
@@ -158,6 +239,15 @@ pub enum ConfigFilesError {
 
     #[error("`model` is not an \"author/slug\" id: {0}")]
     InvalidModel(String),
+
+    #[error("`agent_max_iterations` must be at least 1")]
+    InvalidMaxIterations,
+
+    /// Why the agent's `tools` block could not be turned into tools it can
+    /// call. Carried as text because working it out needs the runtime's
+    /// registry, which this file knows nothing about.
+    #[error("`tools` is not usable: {0}")]
+    InvalidTools(String),
 }
 
 /// The files an agent is configured from, and whether each one was found.
@@ -209,6 +299,10 @@ impl ConfigFiles {
             })?;
         let model = Model::parse(&settings.model)
             .ok_or_else(|| ConfigFilesError::InvalidModel(settings.model.clone()))?;
+        // a turn allowed no iterations would end before it began
+        if settings.agent_max_iterations == 0 {
+            return Err(ConfigFilesError::InvalidMaxIterations);
+        }
 
         let agents_path = dir.join(AGENTS_FILE_NAME);
         let agents_file = ConfigFile {
@@ -270,6 +364,15 @@ impl ConfigFiles {
     /// The model the agent runs on, as named by its `config.json`.
     pub fn model(&self) -> Model {
         self.model.clone()
+    }
+    /// The most requests the agent may make to the model in a single turn.
+    pub fn agent_max_iterations(&self) -> u32 {
+        self.settings.agent_max_iterations
+    }
+    /// The agent's `tools` block, as written. Working out which tools it comes
+    /// to is the runtime's job, since only it holds the registry.
+    pub fn tool_settings(&self) -> ToolSettings {
+        self.settings.tools.clone()
     }
     pub fn files(&self) -> Vec<ConfigFile> {
         vec![
