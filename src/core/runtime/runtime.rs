@@ -9,8 +9,9 @@ use thiserror::Error;
 use crate::core::config::config::Config;
 use crate::core::openrouter::client::{OpenRouter, OpenRouterConfig, OpenRouterError};
 use crate::core::runtime::agent::{Agent, AgentDefinition, AgentError};
-use crate::core::runtime::agent_config::{AgentConfig, Model};
+use crate::core::runtime::agent_config::AgentConfig;
 use crate::core::runtime::agent_config::{ConfigFiles, ConfigFilesError};
+use crate::core::runtime::tool_registry::{AgentTools, ToolRegistry};
 
 use super::agent;
 
@@ -18,6 +19,9 @@ use super::agent;
 pub enum RuntimeError {
     #[error("no agent with id `{0}`")]
     UnknownAgent(String),
+
+    #[error("`{0}` has already started, so its configuration is settled")]
+    AgentAlreadyStarted(String),
 
     #[error("the agent's directory is missing `{0}`")]
     ConfigFileMissing(String),
@@ -54,6 +58,10 @@ impl From<AgentError> for RuntimeError {
 pub struct Runtime {
     config: RuntimeConfig,
     openrouter: Arc<OpenRouter>,
+    /// Every tool the agents in this runtime can be given. Held here rather
+    /// than on the agents: an agent is handed the tools its config came to,
+    /// never the means of working them out.
+    tools: Arc<ToolRegistry>,
     inner: Arc<Mutex<RuntimeInner>>,
 }
 
@@ -103,11 +111,21 @@ impl RuntimeConfig {
 
 impl Runtime {
     pub fn new(config: RuntimeConfig) -> Result<Runtime, RuntimeError> {
+        Runtime::new_with_tools(config, ToolRegistry::with_default_tools())
+    }
+
+    /// The same runtime with a registry of the caller's choosing, so a test can
+    /// stand one up around a tool of its own.
+    pub fn new_with_tools(
+        config: RuntimeConfig,
+        tools: ToolRegistry,
+    ) -> Result<Runtime, RuntimeError> {
         let openrouter = OpenRouter::new(OpenRouterConfig::from_config(&config.config()))?;
 
         let runtime = Runtime {
             config,
             openrouter: Arc::new(openrouter),
+            tools: Arc::new(tools),
             inner: Arc::new(Mutex::new(RuntimeInner { agents: Vec::new() })),
         };
         runtime.load_agents();
@@ -125,6 +143,27 @@ impl Runtime {
         &self.openrouter
     }
 
+    /// The tools this runtime can give an agent.
+    pub fn tools(&self) -> &ToolRegistry {
+        &self.tools
+    }
+
+    /// Reads the agent's files and works its `tools` block out against what
+    /// this runtime can actually run.
+    ///
+    /// Resolving here rather than in the agent loop means a tool name the user
+    /// made up is reported the way a bad model id is — on the configuration
+    /// screen, before the agent runs — and the loop is handed the tools rather
+    /// than looking them up on every request.
+    fn load_config_files(&self, dir: &Path) -> Result<(ConfigFiles, AgentTools), ConfigFilesError> {
+        let config_files = ConfigFiles::load(dir, &self.config.project_dir())?;
+        let tools = self
+            .tools
+            .resolve(&config_files.tool_settings())
+            .map_err(|err| ConfigFilesError::InvalidTools(err.to_string()))?;
+        Ok((config_files, tools))
+    }
+
     // Agent operations //////////////////
     //////////////////////////////////////
 
@@ -135,22 +174,52 @@ impl Runtime {
     /// Agents that are already running are left alone; the rest have their
     /// configuration files re-read.
     pub fn load_agents(&self) {
-        let project_dir = self.config.project_dir();
         let dirs = self.agent_dirs();
+
+        // which directories still need reading is a question about the agents,
+        // so it is answered under the lock — and then let go of again
+        let to_read: Vec<PathBuf> = {
+            let mut inner = self.inner.lock().expect("mutex error");
+
+            // an agent whose directory is gone is dropped, unless it is already
+            // running, in which case its session is kept
+            inner.agents.retain(|agent| {
+                let definition = agent.agent_definition();
+                definition.state().started() || dirs.contains(&definition.config().dir())
+            });
+
+            // a running agent read its files once and keeps what it read, so
+            // there is nothing to be learned by reading them again
+            let settled: Vec<PathBuf> = inner
+                .agents
+                .iter()
+                .map(|agent| agent.agent_definition())
+                .filter(|definition| definition.state().started())
+                .map(|definition| definition.config().dir())
+                .collect();
+
+            dirs.iter()
+                .filter(|dir| !settled.contains(dir))
+                .cloned()
+                .collect()
+        };
+
+        // reading the files and working out the tools they come to happen with
+        // no lock held. the ui reads the agent list on every tick, and a project
+        // directory on a slow disk would otherwise stop it drawing
+        let loaded: Vec<(PathBuf, Result<(ConfigFiles, AgentTools), ConfigFilesError>)> = to_read
+            .into_iter()
+            .map(|dir| {
+                let result = self.load_config_files(&dir);
+                (dir, result)
+            })
+            .collect();
 
         let mut inner = self.inner.lock().expect("mutex error");
 
-        // an agent whose directory is gone is dropped, unless it is already
-        // running, in which case its session is kept
-        inner.agents.retain(|agent| {
-            let definition = agent.agent_definition();
-            definition.state().started() || dirs.contains(&definition.config().dir())
-        });
-
-        for dir in dirs {
+        for (dir, loaded) in loaded {
             // an unusable config.json leaves the agent listed but unconfigured,
             // so the user can see what to fix and reload
-            let loaded = ConfigFiles::load(&dir, &project_dir);
             let existing = inner
                 .agents
                 .iter()
@@ -158,8 +227,8 @@ impl Runtime {
 
             let index = match existing {
                 Some(index) => {
-                    // a running agent already read its files; re-reading them
-                    // would say nothing about the session in flight
+                    // it may have been started while its files were being read,
+                    // and a started agent keeps the configuration it started on
                     if inner.agents[index].agent_definition().state().started() {
                         continue;
                     }
@@ -177,14 +246,14 @@ impl Runtime {
 
             let mut definition = inner.agents[index].definition();
             match loaded {
-                Ok(config_files) => {
-                    let config = definition.config().set_model(config_files.model());
+                Ok((config_files, tools)) => {
+                    let config = definition.config().set_from_config_files(&config_files);
                     definition.set_config(config);
-                    definition.set_config_files(config_files);
+                    definition.set_config_files(config_files, tools);
                 }
                 Err(err) => {
-                    // the model came out of the file that just failed to load
-                    let config = definition.config().set_model(Model::empty());
+                    // the settings came out of the file that just failed to load
+                    let config = definition.config().clear_settings();
                     definition.set_config(config);
                     definition.set_config_error(err);
                 }
@@ -198,25 +267,36 @@ impl Runtime {
 
     /// Re-reads the agent's configuration files, picking up ones the user
     /// added since it was loaded.
+    ///
+    /// Refused once the agent has started. Its settings are read once, when its
+    /// files are loaded, and everything downstream is built from that reading:
+    /// the tools it resolved to, the model its requests name, the settings its
+    /// tools parsed when they started. Reading the file again would leave those
+    /// describing different generations of it — at best a turn offering old
+    /// tools to a new model, at worst one naming a model that had just been
+    /// emptied. An agent picks up an edited `config.json` the way it picked up
+    /// the first one: on a restart.
     pub fn reload_config_files(&self, id: &str) -> Result<ConfigFiles, RuntimeError> {
-        let project_dir = self.config.project_dir();
-
         let inner = self.inner.lock().expect("mutex error");
         let mut definition = inner.agent(id)?.definition();
 
-        let config_files = match ConfigFiles::load(&definition.config().dir(), &project_dir) {
-            Ok(config_files) => config_files,
+        if definition.state().started() {
+            return Err(RuntimeError::AgentAlreadyStarted(id.to_string()));
+        }
+
+        let (config_files, tools) = match self.load_config_files(&definition.config().dir()) {
+            Ok(loaded) => loaded,
             Err(err) => {
-                let config = definition.config().set_model(Model::empty());
+                let config = definition.config().clear_settings();
                 definition.set_config(config);
                 definition.set_config_error(err.clone());
                 return Err(err.into());
             }
         };
 
-        let config = definition.config().set_model(config_files.model());
+        let config = definition.config().set_from_config_files(&config_files);
         definition.set_config(config);
-        definition.set_config_files(config_files.clone());
+        definition.set_config_files(config_files.clone(), tools);
 
         Ok(config_files)
     }

@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::{
     mpsc::{self, Receiver, Sender, TryRecvError},
     Arc, Mutex, MutexGuard,
@@ -7,9 +8,10 @@ use std::thread;
 use thiserror::Error;
 
 use crate::core::openrouter::client::OpenRouter;
-use crate::core::openrouter::types::{ChatCompletionRequest, Message, Usage};
+use crate::core::openrouter::types::{ChatCompletionRequest, Message, ToolChoice, Usage};
 use crate::core::runtime::agent_config::{self, AgentConfig, ConfigFiles, ConfigFilesError};
 use crate::core::runtime::helpers::{classify, Turn};
+use crate::core::runtime::tool_registry::{AgentTools, ToolResult, ToolStates};
 
 /// Why an agent could not be started. Every one of these is a configuration
 /// file the agent needs and cannot use.
@@ -29,7 +31,11 @@ impl From<ConfigFilesError> for AgentError {
             ConfigFilesError::Unreadable { name, error, .. } => {
                 AgentError::ConfigFileUnreadable { name, error }
             }
-            err @ ConfigFilesError::InvalidModel(_) => AgentError::ConfigFileUnreadable {
+            // every way a setting can be wrong reads the same to the user: the
+            // file is there and cannot be used, and the message says why
+            err @ (ConfigFilesError::InvalidModel(_)
+            | ConfigFilesError::InvalidMaxIterations
+            | ConfigFilesError::InvalidTools(_)) => AgentError::ConfigFileUnreadable {
                 name: agent_config::AGENT_CONFIG_FILE_NAME.into(),
                 error: err.to_string(),
             },
@@ -72,6 +78,7 @@ impl Agent {
                 config,
                 state: AgentState::Configuring,
                 config_files: None,
+                tools: AgentTools::empty(),
                 config_error: None,
                 system_prompt: String::new(),
                 messages: Vec::new(),
@@ -147,20 +154,28 @@ impl Agent {
     }
 
     /// Hands the agent the user's next message. While the agent is working the
-    /// message is queued instead, and the thread picks it up on its next time
-    /// around the loop rather than interrupting the turn in flight.
+    /// message is queued instead, and the thread picks it up at the top of its
+    /// next iteration rather than interrupting the request in flight.
+    ///
+    /// With tools that can be mid turn, between one round of tool results and
+    /// the next request, which is what lets the user steer an agent that is
+    /// already working. It is never between an assistant's tool calls and their
+    /// answers, which providers reject.
     pub fn send_message(&self, content: String) {
         {
             let mut definition = self.definition();
             if definition.state() == AgentState::Working {
                 definition.queue_message(Message::user(content));
-                return;
+            } else {
+                definition.push_message(Message::user(content));
+                definition.set_state(AgentState::Working);
             }
-
-            definition.push_message(Message::user(content));
-            definition.set_state(AgentState::Working);
         }
 
+        // told even about a message that was only queued, so that a thread that
+        // has died — a tool that panicked hard enough to take it — is noticed
+        // here rather than leaving the agent working forever. the loop drains a
+        // command it has no use for, so saying so twice costs nothing
         self.run();
     }
 
@@ -189,10 +204,16 @@ impl AgentInner {
     /// The agent loop. It sits on the channel until there is something to
     /// send, and goes back to waiting once the model has finished answering.
     fn run(self: Arc<Self>, commands: Receiver<AgentCommand>) {
+        // the states its tools keep live here, on the agent's own thread, for
+        // exactly as long as the thread does. nothing else can reach them,
+        // which is why a tool mutates its own state without locking, and
+        // whatever a tool opened is closed by its `Drop` when this returns
+        let mut states = ToolStates::new();
+
         while let Ok(command) = commands.recv() {
             match command {
                 AgentCommand::Run => {
-                    let shutting_down = self.run_turns(&commands);
+                    let shutting_down = self.run_turns(&commands, &mut states);
                     if shutting_down {
                         return;
                     }
@@ -203,10 +224,22 @@ impl AgentInner {
     }
 
     /// Sends the conversation and records the reply, going around again while
-    /// there is more to say — a message the user queued while the agent was
-    /// working, or a turn the model has not finished. Returns true when the
-    /// agent went away while it was working, in which case the thread is done.
-    fn run_turns(&self, commands: &Receiver<AgentCommand>) -> bool {
+    /// there is more to do — tool calls the model asked for, or a message the
+    /// user queued while the agent was working. Returns true when the agent
+    /// went away while it was working, in which case the thread is done.
+    ///
+    /// One iteration is one request to the model. A turn is bounded by the
+    /// agent's `agent_max_iterations` so an agent that keeps calling tools
+    /// without ever finishing costs a known amount rather than running until
+    /// the user notices.
+    fn run_turns(&self, commands: &Receiver<AgentCommand>, states: &mut ToolStates) -> bool {
+        let settings = {
+            let definition = self.definition.lock().expect("mutex error");
+            run_settings(&definition)
+        };
+
+        let mut iteration: u32 = 0;
+
         loop {
             // the agent can be dropped while a turn is in flight, and what is
             // queued behind that turn then belongs to a conversation nobody
@@ -217,57 +250,116 @@ impl AgentInner {
 
             let request = {
                 let mut definition = self.definition.lock().expect("mutex error");
+
+                // checked before anything is taken off the queue: a turn that
+                // gives up here never sends another request, and a message
+                // moved into the conversation now would look answered on screen
+                // while never having reached the model. it stays queued, and
+                // the user's next turn picks it up
+                if iteration >= settings.max_iterations {
+                    definition.set_state(AgentState::Failed(format!(
+                        "the agent did not finish within {} iterations",
+                        settings.max_iterations
+                    )));
+                    return false;
+                }
+
                 // anything the user typed mid turn joins the conversation here,
-                // at the top of the loop, so it is sent with the next request
+                // at the top of the loop, so it is sent with the next request.
+                // it lands after a complete set of tool results and never
+                // between an assistant's tool calls and their answers, which
+                // providers reject — moving this call later would break that
                 definition.take_queued_messages();
                 definition.set_state(AgentState::Working);
-                chat_request(&definition)
+
+                chat_request(&definition, &settings)
             };
+            iteration += 1;
 
             let result = self.openrouter.chat_completion(request);
 
-            let mut definition = self.definition.lock().expect("mutex error");
-            let turn = match result {
-                Err(err) => {
-                    definition.set_state(AgentState::Failed(err.to_string()));
-                    return false;
-                }
-                Ok(response) => {
-                    if let Some(usage) = response.usage.clone() {
-                        definition.set_usage(usage);
+            // the tool calls are cloned out from under the lock so the commands
+            // they ask for run without the ui waiting on them
+            let (turn, tool_calls) = {
+                let mut definition = self.definition.lock().expect("mutex error");
+                match result {
+                    Err(err) => {
+                        definition.set_state(AgentState::Failed(err.to_string()));
+                        return false;
                     }
-                    match response.first_choice() {
-                        Some(choice) => {
-                            definition.push_message(choice.message.clone());
-                            classify(choice)
+                    Ok(response) => {
+                        if let Some(usage) = response.usage.clone() {
+                            definition.set_usage(usage);
                         }
-                        None => Turn::Failed("the model answered with no choices".into()),
+                        match response.first_choice() {
+                            Some(choice) => {
+                                definition.push_message(choice.message.clone());
+                                (classify(choice), choice.message.tool_calls().to_vec())
+                            }
+                            None => (
+                                Turn::Failed("the model answered with no choices".into()),
+                                Vec::new(),
+                            ),
+                        }
                     }
                 }
             };
 
             match turn {
                 Turn::Failed(err) => {
-                    definition.set_state(AgentState::Failed(err));
+                    self.definition
+                        .lock()
+                        .expect("mutex error")
+                        .set_state(AgentState::Failed(err));
                     return false;
                 }
-                // the model asked for tool calls, and nothing runs them yet;
-                // sending the same conversation back would only ask again
-                Turn::Continue => {
-                    definition.set_state(AgentState::Failed("tool calls are not supported".into()));
-                    return false;
-                }
-                // the queue is checked under the same lock that idles the
-                // agent, so a message sent right now is either queued and
-                // answered below or sent as a turn of its own
                 Turn::Done => {
-                    if definition.queued_messages().is_empty() {
-                        definition.set_state(AgentState::Idle);
+                    if self.finish_turn() {
                         return false;
+                    }
+                    iteration = 0;
+                }
+                Turn::Continue => {
+                    // no lock is held here: a tool call is a command running on
+                    // this thread and can take as long as the command does,
+                    // while the ui reads the definition every tick
+                    let results: Vec<ToolResult> = tool_calls
+                        .iter()
+                        .map(|call| settings.tools.dispatch(states, &settings.dir, call))
+                        .collect();
+
+                    // every call the model made is answered, in the order it
+                    // made them, even when one of them ended the turn
+                    let ends_turn = {
+                        let mut definition = self.definition.lock().expect("mutex error");
+                        for result in &results {
+                            definition.push_message(result.message());
+                        }
+                        results.iter().any(|result| result.ends_turn())
+                    };
+
+                    if ends_turn {
+                        if self.finish_turn() {
+                            return false;
+                        }
+                        iteration = 0;
                     }
                 }
             }
         }
+    }
+
+    /// Ends the turn. The queue is checked under the same lock that idles the
+    /// agent, so a message sent right now is either queued and answered on the
+    /// next turn or sent as a turn of its own. True when the agent went idle
+    /// and the loop is finished with it.
+    fn finish_turn(&self) -> bool {
+        let mut definition = self.definition.lock().expect("mutex error");
+        if definition.queued_messages().is_empty() {
+            definition.set_state(AgentState::Idle);
+            return true;
+        }
+        false
     }
 }
 
@@ -301,11 +393,44 @@ fn build_system_prompt(config_files: &ConfigFiles) -> String {
     )
 }
 
-fn chat_request(definition: &AgentDefinition) -> ChatCompletionRequest {
-    ChatCompletionRequest::new(
-        definition.config().model().full_slug(),
+/// Everything a run of the agent loop works from, read once before it starts.
+///
+/// An agent's `config.json` is read when its files are loaded and not again
+/// while it runs, so none of this changes underneath the loop. Reading it all in
+/// one go is what keeps that true of the request as well: a reload part way
+/// through a turn cannot leave one iteration asking a new model for the old
+/// tools, or asking for a model that has just been emptied.
+struct RunSettings {
+    model: String,
+    dir: PathBuf,
+    max_iterations: u32,
+    tools: AgentTools,
+}
+
+fn run_settings(definition: &AgentDefinition) -> RunSettings {
+    let config = definition.config();
+    RunSettings {
+        model: config.model().full_slug(),
+        dir: config.dir(),
+        max_iterations: config.max_iterations(),
+        tools: definition.tools(),
+    }
+}
+
+/// The request for one iteration: the conversation so far, plus the tools the
+/// agent may call. An agent with no tools at all leaves `tools` off the request
+/// entirely — an empty `tools: []` is rejected by some providers.
+fn chat_request(definition: &AgentDefinition, settings: &RunSettings) -> ChatCompletionRequest {
+    let request = ChatCompletionRequest::new(
+        settings.model.clone(),
         definition.request_messages(),
-    )
+    );
+    if settings.tools.is_empty() {
+        return request;
+    }
+    request
+        .set_tools(settings.tools.definitions())
+        .set_tool_choice(ToolChoice::auto())
 }
 
 /// A snapshot of everything the ui needs to render an agent.
@@ -317,6 +442,11 @@ pub struct AgentDefinition {
     // state
     state: AgentState,
     config_files: Option<ConfigFiles>,
+    /// The tools the agent may call, worked out from its `tools` block when its
+    /// files were read. Set with `config_files` and cleared with it, since it is
+    /// the same file that decides both. Held resolved rather than as settings so
+    /// no request has to look anything up.
+    tools: AgentTools,
     /// Why the agent's `config.json` could not be loaded, when it could not.
     /// Set instead of `config_files`, since without that file there is no
     /// configuration to speak of.
@@ -343,6 +473,10 @@ impl AgentDefinition {
     }
     pub fn config_files(&self) -> Option<ConfigFiles> {
         self.config_files.clone()
+    }
+    /// The tools the agent may call. Empty until its files have been read.
+    pub fn tools(&self) -> AgentTools {
+        self.tools.clone()
     }
     /// Why the configuration could not be read. Present exactly when
     /// `config_files` is absent, once the agent has been loaded.
@@ -374,14 +508,19 @@ impl AgentDefinition {
     pub fn set_state(&mut self, state: AgentState) {
         self.state = state;
     }
-    pub fn set_config_files(&mut self, config_files: ConfigFiles) {
+    /// The files the agent was configured from, and the tools they came to.
+    /// They are set together because they are read together; nothing should be
+    /// able to leave one describing a `config.json` the other does not.
+    pub fn set_config_files(&mut self, config_files: ConfigFiles, tools: AgentTools) {
         self.config_files = Some(config_files);
+        self.tools = tools;
         self.config_error = None;
     }
     /// Records that the agent has no usable configuration, dropping whatever
     /// was read before it: the files on disk no longer say what it holds.
     pub fn set_config_error(&mut self, error: ConfigFilesError) {
         self.config_files = None;
+        self.tools = AgentTools::empty();
         self.config_error = Some(error);
     }
     pub fn set_system_prompt(&mut self, system_prompt: String) {

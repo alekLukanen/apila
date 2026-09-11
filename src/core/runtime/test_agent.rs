@@ -6,6 +6,7 @@ use std::time::Duration;
 use crate::core::openrouter::client::{OpenRouter, OpenRouterConfig};
 use crate::core::openrouter::types::Message;
 use crate::core::runtime::agent_config::{AgentConfig, ConfigFiles, ConfigFilesError, Model};
+use crate::core::runtime::tool_registry::{AgentTools, ToolRegistry};
 use crate::core::test_support::{
     agent_dir, project_dir, wait_until, write_directive, StubOpenRouter,
 };
@@ -53,14 +54,22 @@ fn config_files_and_a_config_error_replace_one_another() {
     let mut agent = agent("builder");
     let mut definition = agent.definition();
 
-    definition.set_config_files(config_files);
+    let tools = ToolRegistry::with_default_tools()
+        .resolve(&config_files.tool_settings())
+        .expect("resolve tools");
+
+    definition.set_config_files(config_files, tools);
     assert!(definition.config_files().is_some());
     assert!(definition.config_error().is_none());
+    // end_turn is on for every agent, so a configured agent always has one
+    assert_eq!(definition.tools().names(), vec!["end_turn".to_string()]);
 
-    // the files no longer say what the agent holds, so they go with the error
+    // the files no longer say what the agent holds, so they go with the error,
+    // and so do the tools they were read into
     definition.set_config_error(config_error());
     assert!(definition.config_files().is_none());
     assert!(definition.config_error().is_some());
+    assert!(definition.tools().is_empty());
 }
 
 #[test]
@@ -178,7 +187,9 @@ fn a_dropped_agent_stops_rather_than_working_through_its_queue() {
         .set_dir(dir);
 
     let agent = Agent::new("builder".into(), config, Arc::new(openrouter));
-    agent.definition().set_config_files(config_files);
+    agent
+        .definition()
+        .set_config_files(config_files, AgentTools::empty());
     agent.start().expect("start the agent");
 
     wait_until("the directive to go out", || server.requests().len() == 1);
