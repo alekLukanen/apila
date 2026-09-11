@@ -61,12 +61,3 @@ default for either.
 | `end_turn` | always | none |
 | `bash` | `"enabled": ["bash"]` | `bash_timeout`, in seconds (default 120) |
 
-`end_turn` is how an agent says it has finished its work, so every agent has it
-whether or not it is listed. A turn also ends when the agent simply answers in
-text without asking for a tool.
-
-`bash` runs a command with `bash -c` in the agent's own directory and hands back
-the exit code, stdout and stderr. A command that outruns `bash_timeout` is
-killed, and long output is cut short. **Nothing sandboxes it**: an agent with
-`bash` enabled can do anything the user running apila can do.
-

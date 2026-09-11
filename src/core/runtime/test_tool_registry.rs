@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -223,6 +223,58 @@ impl ToolState for ClosingState {
     }
 }
 
+/// A tool whose state panics on every call, standing in for one with a bug in
+/// it. `started` counts how many states it has had to make.
+struct PanickingTool {
+    started: Arc<AtomicUsize>,
+}
+
+impl Tool for PanickingTool {
+    fn name(&self) -> String {
+        "panicking".into()
+    }
+    fn description(&self) -> String {
+        "panics".into()
+    }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {}})
+    }
+    fn new_state(&self, _context: &ToolContext) -> Result<Box<dyn ToolState>, ToolError> {
+        self.started.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(PanickingState))
+    }
+}
+
+struct PanickingState;
+
+impl ToolState for PanickingState {
+    fn run(
+        &mut self,
+        _context: &ToolContext,
+        _arguments: &serde_json::Value,
+    ) -> Result<ToolOutput, ToolError> {
+        panic!("the tool went bang")
+    }
+}
+
+/// A tool that panics before it even gets going.
+struct PanickingStartTool;
+
+impl Tool for PanickingStartTool {
+    fn name(&self) -> String {
+        "panicking_start".into()
+    }
+    fn description(&self) -> String {
+        "panics while starting".into()
+    }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {}})
+    }
+    fn new_state(&self, _context: &ToolContext) -> Result<Box<dyn ToolState>, ToolError> {
+        panic!("the tool went bang while starting")
+    }
+}
+
 /// A tool that refuses any settings at all, for the config checks.
 struct PickyTool;
 
@@ -409,19 +461,54 @@ fn a_config_a_tool_refuses_is_rejected() {
     assert!(matches!(err, ToolSettingsError::InvalidToolConfig { tool, .. } if tool == "picky"));
 }
 
-/// A config for a tool the agent has not switched on is a setting waiting to
-/// be used, not a mistake to report.
+/// A config for a tool the agent has not switched on is a setting waiting to be
+/// used, so it does not put the tool in front of the model.
 #[test]
-fn a_config_for_a_tool_that_is_not_enabled_is_ignored() {
+fn a_config_for_a_tool_that_is_not_enabled_does_not_offer_the_tool() {
     let tools = registry()
+        .register(Arc::new(PickyTool))
+        .resolve(&settings(
+            &["echo"],
+            vec![tool_config("picky", serde_json::json!({}))],
+        ))
+        .expect("resolve");
+
+    assert!(!tools.names().contains(&"picky".to_string()));
+}
+
+/// It is still checked, though: settings that were wrong all along should not
+/// wait to be discovered until the day the tool is switched on.
+#[test]
+fn a_config_for_a_tool_that_is_not_enabled_is_still_checked() {
+    let err = registry()
         .register(Arc::new(PickyTool))
         .resolve(&settings(
             &["echo"],
             vec![tool_config("picky", serde_json::json!({"nope": 1}))],
         ))
-        .expect("resolve");
+        .expect_err("bad config");
 
-    assert!(!tools.names().contains(&"picky".to_string()));
+    assert!(matches!(err, ToolSettingsError::InvalidToolConfig { tool, .. } if tool == "picky"));
+}
+
+/// A misspelled tool name in `configs` does nothing at all if it is left alone,
+/// so the agent would quietly run on defaults it did not ask for.
+#[test]
+fn a_config_naming_a_tool_that_does_not_exist_is_rejected() {
+    let err = registry()
+        .resolve(&settings(
+            &["echo"],
+            vec![tool_config("ecko", serde_json::json!({"a": 1}))],
+        ))
+        .expect_err("no such tool");
+
+    match err {
+        ToolSettingsError::UnknownToolConfig { name, available } => {
+            assert_eq!(name, "ecko");
+            assert!(available.contains("echo"), "{}", available);
+        }
+        other => panic!("expected UnknownToolConfig, got {:?}", other),
+    }
 }
 
 #[test]
@@ -696,15 +783,22 @@ fn a_state_is_closed_when_it_goes_out_of_scope() {
 /// only ever work in its own.
 #[test]
 fn a_tool_is_run_in_the_directory_it_is_given() {
+    let given = std::env::temp_dir().join(format!("apila-test-registry-dir-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&given);
+    std::fs::create_dir_all(&given).expect("create the directory");
+    std::fs::write(given.join("marker.txt"), "the given directory").expect("write marker");
+
     let tools = ToolRegistry::with_default_tools()
         .resolve(&settings(&["bash"], Vec::new()))
         .expect("resolve");
     let mut states = ToolStates::new();
 
+    // a relative path, so the answer can only come from the directory that was
+    // passed in — an absolute one would read the same from anywhere
     let result = tools.dispatch(
         &mut states,
-        Path::new("/"),
-        &call("bash", r#"{"command": "ls -d /tmp"}"#),
+        &given,
+        &call("bash", r#"{"command": "cat marker.txt"}"#),
     );
     let content = result
         .message()
@@ -712,5 +806,97 @@ fn a_tool_is_run_in_the_directory_it_is_given() {
         .expect("a tool message has content")
         .to_string();
 
-    assert!(content.contains("exit code: 0"), "{}", content);
+    assert!(content.contains("the given directory"), "{}", content);
+}
+
+// Panicking tools ///////////////////
+//////////////////////////////////////
+
+/// A tool is someone else's code as far as the loop is concerned. One that
+/// panics would otherwise take the agent's thread with it and leave the agent
+/// working forever on a tool call nothing ever answered.
+#[test]
+fn a_tool_that_panics_answers_the_model_instead_of_taking_the_thread() {
+    let tools = registry()
+        .register(Arc::new(PanickingTool {
+            started: Arc::new(AtomicUsize::new(0)),
+        }))
+        .resolve(&settings(&["panicking"], Vec::new()))
+        .expect("resolve");
+    let mut states = ToolStates::new();
+
+    let content = content(&tools, &mut states, &call("panicking", "{}"));
+
+    assert!(content.starts_with("error: "), "{}", content);
+    assert!(content.contains("the tool went bang"), "{}", content);
+}
+
+/// A state that unwound may be halfway through whatever it was doing, so it is
+/// dropped rather than called again.
+#[test]
+fn a_state_that_panicked_is_not_used_again() {
+    let started = Arc::new(AtomicUsize::new(0));
+    let tools = registry()
+        .register(Arc::new(PanickingTool {
+            started: Arc::clone(&started),
+        }))
+        .resolve(&settings(&["panicking"], Vec::new()))
+        .expect("resolve");
+    let mut states = ToolStates::new();
+
+    content(&tools, &mut states, &call("panicking", "{}"));
+    content(&tools, &mut states, &call("panicking", "{}"));
+
+    // a state that had been kept would have been reused, and only one made
+    assert_eq!(started.load(Ordering::SeqCst), 2);
+    assert!(!states.started().contains(&"panicking".to_string()));
+}
+
+#[test]
+fn a_tool_that_panics_while_starting_answers_the_model() {
+    let tools = registry()
+        .register(Arc::new(PanickingStartTool))
+        .resolve(&settings(&["panicking_start"], Vec::new()))
+        .expect("resolve");
+    let mut states = ToolStates::new();
+
+    let content = content(&tools, &mut states, &call("panicking_start", "{}"));
+
+    assert!(content.contains("panicked while starting"), "{}", content);
+    assert!(content.contains("went bang"), "{}", content);
+}
+
+/// Several calls in one assistant message each get their own answer, and a tool
+/// that blows up in the middle does not cost the others theirs.
+#[test]
+fn every_call_in_a_batch_is_answered_even_when_one_panics() {
+    let tools = registry()
+        .register(Arc::new(PanickingTool {
+            started: Arc::new(AtomicUsize::new(0)),
+        }))
+        .resolve(&settings(&["echo", "panicking"], Vec::new()))
+        .expect("resolve");
+    let mut states = ToolStates::new();
+
+    let calls = vec![
+        call("echo", "{}"),
+        call("panicking", "{}"),
+        call("always_on", "{}"),
+    ];
+    let answered: Vec<String> = calls
+        .iter()
+        .map(|one| match tools.dispatch(&mut states, &dir(), one).message() {
+            Message::Tool { tool_call_id, .. } => tool_call_id,
+            other => panic!("expected a tool message, got {:?}", other),
+        })
+        .collect();
+
+    assert_eq!(
+        answered,
+        vec![
+            "call_echo".to_string(),
+            "call_panicking".to_string(),
+            "call_always_on".to_string()
+        ]
+    );
 }

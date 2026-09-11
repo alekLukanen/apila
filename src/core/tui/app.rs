@@ -32,6 +32,11 @@ const CONTEXT_LIMIT_TOKENS: u64 = 1_000_000;
 /// more there was. The model still gets all of it.
 const TOOL_OUTPUT_LINES: usize = 12;
 
+/// The column a tab advances to. Terminals use eight and files are written
+/// expecting it, so anything else would misalign the thing the transcript is
+/// trying to show faithfully.
+const TAB_WIDTH: usize = 8;
+
 #[derive(Debug, Parser)]
 #[command(version, about, long_about = None)]
 pub struct Args {
@@ -735,7 +740,7 @@ impl TUIApp {
     /// One message rendered as a labeled block, hard wrapped to `width` so the
     /// transcript can be scrolled by whole lines. `directive` marks the opening
     /// turn that came out of `DIRECTIVE.md` rather than from the user.
-    fn message_lines(message: &Message, width: usize, directive: bool) -> Vec<Line<'static>> {
+    pub fn message_lines(message: &Message, width: usize, directive: bool) -> Vec<Line<'static>> {
         let (label, style) = match message {
             Message::User { .. } if directive => ("directive", Style::default().yellow().bold()),
             Message::User { .. } => ("you", Style::default().cyan().bold()),
@@ -796,23 +801,93 @@ impl TUIApp {
         format!("{}…", kept)
     }
 
-    /// Word wraps `text` to `width` columns, keeping the author's own line breaks.
-    fn wrap(text: &str, width: usize) -> Vec<String> {
+    /// Wraps `text` to `width` columns, keeping every character it was given.
+    ///
+    /// Nothing is collapsed: indentation, the runs of spaces that line a listing
+    /// up into columns, and the blank lines between paragraphs all survive. The
+    /// transcript carries file contents and command output, and a diff or an
+    /// `ls -l` whose spacing has been tidied away is no longer the thing the
+    /// agent was looking at.
+    ///
+    /// Lines are broken after a space where there is one to break after, and cut
+    /// at the width where there is not, so every line that comes back fits — a
+    /// caller counting lines is counting what will be drawn.
+    pub fn wrap(text: &str, width: usize) -> Vec<String> {
+        // a zero width would otherwise make no line ever fit
+        let width = width.max(1);
         let mut out = Vec::new();
-        for paragraph in text.split('\n') {
-            let mut current = String::new();
-            for word in paragraph.split_whitespace() {
-                if current.is_empty() {
-                    current = word.to_string();
-                } else if current.chars().count() + 1 + word.chars().count() <= width {
-                    current.push(' ');
-                    current.push_str(word);
-                } else {
-                    out.push(std::mem::take(&mut current));
-                    current = word.to_string();
-                }
+
+        for line in text.split('\n') {
+            // a file with windows line endings would otherwise draw the carriage
+            // return as a glyph of its own at the end of every line
+            let line = Self::expand_tabs(line.strip_suffix('\r').unwrap_or(line));
+            let characters: Vec<char> = line.chars().collect();
+
+            if characters.len() <= width {
+                out.push(line);
+                continue;
             }
-            out.push(current);
+
+            let mut start = 0;
+            while start < characters.len() {
+                if characters.len() - start <= width {
+                    out.push(characters[start..].iter().collect());
+                    break;
+                }
+                let end = Self::break_at(&characters, start, start + width);
+                out.push(characters[start..end].iter().collect());
+                start = end;
+            }
+        }
+
+        out
+    }
+
+    /// Where to end a line that starts at `start` and cannot reach past `limit`.
+    ///
+    /// Just after the last space, so the space stays on the line it ends and the
+    /// next line starts on something worth reading. A run of characters with
+    /// nothing to break on — a minified file, a base64 blob — is cut at the
+    /// limit instead: left whole it would be drawn clipped, and a cap on the
+    /// number of lines would let the whole of it through believing it was one
+    /// line.
+    fn break_at(characters: &[char], start: usize, limit: usize) -> usize {
+        // a space inside the indentation is not somewhere to break: doing so
+        // would hand back a line of nothing but whitespace and come straight
+        // back for the rest
+        let Some(content) = (start..limit).find(|index| characters[*index] != ' ') else {
+            return limit;
+        };
+
+        (content..limit)
+            .rev()
+            .find(|index| characters[*index] == ' ')
+            .map(|index| index + 1)
+            .unwrap_or(limit)
+    }
+
+    /// Replaces tabs with the spaces a terminal would have drawn for them.
+    ///
+    /// A tab is not something that can be placed in a cell — it would take one
+    /// column or none — so leaving it in is what turns a tab indented file into a
+    /// ragged one. Eight is what a terminal uses, and what the file was written
+    /// against.
+    fn expand_tabs(line: &str) -> String {
+        if !line.contains('\t') {
+            return line.to_string();
+        }
+
+        let mut out = String::with_capacity(line.len());
+        let mut column = 0;
+        for character in line.chars() {
+            if character == '\t' {
+                let advance = TAB_WIDTH - (column % TAB_WIDTH);
+                out.extend(std::iter::repeat_n(' ', advance));
+                column += advance;
+            } else {
+                out.push(character);
+                column += 1;
+            }
         }
         out
     }

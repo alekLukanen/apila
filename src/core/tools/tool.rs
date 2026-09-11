@@ -1,4 +1,8 @@
+use std::any::Any;
+use std::cell::Cell;
+use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
+use std::sync::Once;
 
 use thiserror::Error;
 
@@ -154,4 +158,79 @@ pub enum ToolError {
 
     #[error("the tool's config is not usable: {error}")]
     InvalidConfig { error: String },
+
+    /// The tool was running and something went wrong that the call is not to
+    /// blame for.
+    #[error("the tool failed while running: {error}")]
+    Failed { error: String },
+}
+
+// Panics ////////////////////////////
+//////////////////////////////////////
+
+thread_local! {
+    /// Set while this thread is inside [`catching_panics`].
+    static CATCHING_PANICS: Cell<bool> = const { Cell::new(false) };
+}
+
+/// True when this thread is running something whose panic is about to be
+/// caught and turned into a result.
+///
+/// The terminal's panic hook reads this: a panic the program is not going to
+/// die from must not tear down the alternate screen or print over it.
+pub fn panics_are_being_caught() -> bool {
+    CATCHING_PANICS.with(|catching| catching.get())
+}
+
+/// Runs `body`, turning a panic into an `Err` carrying whatever the panic said.
+///
+/// A tool is, as far as the agent loop is concerned, someone else's code. One
+/// that panics would otherwise take the agent's thread with it, and the agent
+/// would sit in `Working` forever with a tool call in its transcript that
+/// nothing ever answered — so a panic is reported to the model the same way a
+/// refused call is.
+///
+/// A tool that unwinds may be halfway through whatever it was doing, which is
+/// why the caller drops its state rather than calling it again.
+pub fn catching_panics<T>(body: impl FnOnce() -> T) -> Result<T, String> {
+    quieten_caught_panics();
+
+    CATCHING_PANICS.with(|catching| catching.set(true));
+    let result = panic::catch_unwind(AssertUnwindSafe(body));
+    CATCHING_PANICS.with(|catching| catching.set(false));
+    result.map_err(panic_message)
+}
+
+static QUIETEN: Once = Once::new();
+
+/// Stops a panic that is about to be caught from being reported as though the
+/// program were going down.
+///
+/// Whatever hook is already in place is kept and deferred to for every other
+/// panic, so this composes with the terminal's hook whichever of the two is
+/// installed first. It is done here rather than left to the caller so that a
+/// tool panicking is quiet in its own right — a library that prints a backtrace
+/// over the thing that already handled the failure is a library that cannot be
+/// used from a full screen ui.
+fn quieten_caught_panics() {
+    QUIETEN.call_once(|| {
+        let hook = panic::take_hook();
+        panic::set_hook(Box::new(move |panic_info| {
+            if panics_are_being_caught() {
+                return;
+            }
+            hook(panic_info);
+        }));
+    });
+}
+
+/// Whatever a panic said, when it said anything this can read.
+fn panic_message(payload: Box<dyn Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        return (*message).to_string();
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+    "no message".to_string()
 }

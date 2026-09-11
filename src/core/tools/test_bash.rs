@@ -1,8 +1,9 @@
 use std::path::PathBuf;
-use std::time::Instant;
-use std::{env, fs};
+use std::process::Command;
+use std::time::{Duration, Instant};
+use std::{env, fs, thread};
 
-use super::bash::{BashTool, DEFAULT_BASH_TIMEOUT, MAX_STREAM_BYTES};
+use super::bash::{BashTool, MAX_STREAM_BYTES};
 use super::tool::{Tool, ToolContext, ToolError, ToolState};
 
 /// Creates a unique temp directory for a single test to work in.
@@ -104,10 +105,16 @@ fn output_longer_than_the_limit_is_cut_short() {
     );
 
     assert!(content.contains("… truncated,"), "cut short");
+    // the kept bytes, the headings and the truncation note, and nothing else
     assert!(
-        content.len() < MAX_STREAM_BYTES * 3,
+        content.len() < MAX_STREAM_BYTES + 512,
         "the output was not bounded: {} bytes",
         content.len()
+    );
+    assert!(
+        content.contains(&format!("{} more bytes", 200_000 - MAX_STREAM_BYTES)),
+        "the dropped byte count is wrong: {}",
+        &content[content.len().saturating_sub(120)..]
     );
 }
 
@@ -159,13 +166,18 @@ fn a_command_that_cannot_be_started_is_reported() {
     assert!(matches!(err, ToolError::NotStarted { .. }));
 }
 
+/// Observed rather than asserted about the constant: a command that outlives
+/// any plausible small timeout still finishes, which it only can if the fallback
+/// is the generous default.
 #[test]
 fn the_timeout_falls_back_to_the_default_when_the_config_leaves_it_out() {
-    let config = serde_json::json!({});
+    let dir = temp_dir("default-timeout");
 
-    assert!(BashTool::new().validate_config(&config).is_ok());
-    // the default is long enough that a quick command is nowhere near it
-    assert!(DEFAULT_BASH_TIMEOUT >= 30);
+    let content = run(&dir, serde_json::json!({}), "sleep 2; echo outlasted");
+
+    assert!(content.contains("outlasted"), "{}", content);
+    assert!(content.contains("exit code: 0"), "{}", content);
+    assert!(!content.contains("timed out"), "{}", content);
 }
 
 /// A misspelled setting does nothing at all if it is quietly ignored, so it is
@@ -189,4 +201,104 @@ fn the_settings_are_read_once_when_the_tool_starts() {
         .expect("bad settings");
 
     assert!(matches!(err, ToolError::InvalidConfig { .. }));
+}
+
+/// Whether any process on this machine was started from a command line holding
+/// `marker`. Used to watch what a command left behind.
+fn any_process_matching(marker: &str) -> bool {
+    Command::new("pgrep")
+        .arg("-f")
+        .arg(marker)
+        .output()
+        .map(|output| !output.stdout.is_empty())
+        .unwrap_or(false)
+}
+
+fn wait_until_gone(marker: &str) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if !any_process_matching(marker) {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
+
+/// A command can exit while something it started keeps the pipe open and keeps
+/// writing. The reader has to stop rather than read and discard for the life of
+/// the process, and dropping its end of the pipe is what finishes off the
+/// orphan — so the orphan going away is the proof that the reader stopped.
+#[test]
+fn a_command_that_leaves_something_writing_does_not_read_forever() {
+    let dir = temp_dir("orphan-writer");
+    let marker = format!("apila-probe-writer-{}", std::process::id());
+
+    let content = run(
+        &dir,
+        serde_json::json!({"bash_timeout": 30}),
+        &format!("yes {} &", marker),
+    );
+
+    assert!(content.contains("exit code: 0"), "{}", content);
+    // the reader never reached the end of the pipe, so the output it captured is
+    // what had arrived rather than all there was, and it says so
+    assert!(
+        content.contains("still writing"),
+        "the output claimed to be complete: {}",
+        &content[..content.len().min(200)]
+    );
+    assert!(
+        wait_until_gone(&marker),
+        "something is still reading the orphan's output, so it never got a broken pipe"
+    );
+}
+
+/// The message the model reads has to be true: work that is still running is
+/// work it must not assume was undone.
+#[test]
+fn work_a_timed_out_command_started_is_killed_with_it() {
+    let dir = temp_dir("timeout-group");
+    let marker = dir.join("survived.txt");
+
+    let content = run(
+        &dir,
+        serde_json::json!({"bash_timeout": 1}),
+        // the shell exits as soon as it is killed, but the work it forked would
+        // carry on writing into the agent's directory
+        "(sleep 3; echo survived > survived.txt) & wait",
+    );
+
+    assert!(
+        content.contains("everything it started were killed"),
+        "{}",
+        content
+    );
+
+    // long enough that the work would have finished had it lived
+    thread::sleep(Duration::from_secs(4));
+    assert!(
+        !marker.exists(),
+        "the command was reported killed but its work carried on"
+    );
+}
+
+/// A command that deliberately detaches is left alone when it exits normally:
+/// an agent starting a long running server is doing that on purpose. Only a
+/// timeout takes the whole group.
+#[test]
+fn a_command_that_exits_normally_does_not_have_its_group_killed() {
+    let dir = temp_dir("no-group-kill");
+    let marker = dir.join("finished.txt");
+
+    let content = run(
+        &dir,
+        serde_json::json!({"bash_timeout": 30}),
+        // redirected away from the pipe, so nothing depends on the reader
+        "(sleep 1; echo finished > finished.txt) > /dev/null 2>&1 & echo started",
+    );
+
+    assert!(content.contains("exit code: 0"), "{}", content);
+    thread::sleep(Duration::from_secs(2));
+    assert!(marker.exists(), "detached work was killed: {}", content);
 }

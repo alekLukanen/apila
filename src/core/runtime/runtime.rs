@@ -20,6 +20,9 @@ pub enum RuntimeError {
     #[error("no agent with id `{0}`")]
     UnknownAgent(String),
 
+    #[error("`{0}` has already started, so its configuration is settled")]
+    AgentAlreadyStarted(String),
+
     #[error("the agent's directory is missing `{0}`")]
     ConfigFileMissing(String),
 
@@ -173,19 +176,50 @@ impl Runtime {
     pub fn load_agents(&self) {
         let dirs = self.agent_dirs();
 
+        // which directories still need reading is a question about the agents,
+        // so it is answered under the lock — and then let go of again
+        let to_read: Vec<PathBuf> = {
+            let mut inner = self.inner.lock().expect("mutex error");
+
+            // an agent whose directory is gone is dropped, unless it is already
+            // running, in which case its session is kept
+            inner.agents.retain(|agent| {
+                let definition = agent.agent_definition();
+                definition.state().started() || dirs.contains(&definition.config().dir())
+            });
+
+            // a running agent read its files once and keeps what it read, so
+            // there is nothing to be learned by reading them again
+            let settled: Vec<PathBuf> = inner
+                .agents
+                .iter()
+                .map(|agent| agent.agent_definition())
+                .filter(|definition| definition.state().started())
+                .map(|definition| definition.config().dir())
+                .collect();
+
+            dirs.iter()
+                .filter(|dir| !settled.contains(dir))
+                .cloned()
+                .collect()
+        };
+
+        // reading the files and working out the tools they come to happen with
+        // no lock held. the ui reads the agent list on every tick, and a project
+        // directory on a slow disk would otherwise stop it drawing
+        let loaded: Vec<(PathBuf, Result<(ConfigFiles, AgentTools), ConfigFilesError>)> = to_read
+            .into_iter()
+            .map(|dir| {
+                let result = self.load_config_files(&dir);
+                (dir, result)
+            })
+            .collect();
+
         let mut inner = self.inner.lock().expect("mutex error");
 
-        // an agent whose directory is gone is dropped, unless it is already
-        // running, in which case its session is kept
-        inner.agents.retain(|agent| {
-            let definition = agent.agent_definition();
-            definition.state().started() || dirs.contains(&definition.config().dir())
-        });
-
-        for dir in dirs {
+        for (dir, loaded) in loaded {
             // an unusable config.json leaves the agent listed but unconfigured,
             // so the user can see what to fix and reload
-            let loaded = self.load_config_files(&dir);
             let existing = inner
                 .agents
                 .iter()
@@ -193,8 +227,8 @@ impl Runtime {
 
             let index = match existing {
                 Some(index) => {
-                    // a running agent already read its files; re-reading them
-                    // would say nothing about the session in flight
+                    // it may have been started while its files were being read,
+                    // and a started agent keeps the configuration it started on
                     if inner.agents[index].agent_definition().state().started() {
                         continue;
                     }
@@ -233,9 +267,22 @@ impl Runtime {
 
     /// Re-reads the agent's configuration files, picking up ones the user
     /// added since it was loaded.
+    ///
+    /// Refused once the agent has started. Its settings are read once, when its
+    /// files are loaded, and everything downstream is built from that reading:
+    /// the tools it resolved to, the model its requests name, the settings its
+    /// tools parsed when they started. Reading the file again would leave those
+    /// describing different generations of it — at best a turn offering old
+    /// tools to a new model, at worst one naming a model that had just been
+    /// emptied. An agent picks up an edited `config.json` the way it picked up
+    /// the first one: on a restart.
     pub fn reload_config_files(&self, id: &str) -> Result<ConfigFiles, RuntimeError> {
         let inner = self.inner.lock().expect("mutex error");
         let mut definition = inner.agent(id)?.definition();
+
+        if definition.state().started() {
+            return Err(RuntimeError::AgentAlreadyStarted(id.to_string()));
+        }
 
         let (config_files, tools) = match self.load_config_files(&definition.config().dir()) {
             Ok(loaded) => loaded,

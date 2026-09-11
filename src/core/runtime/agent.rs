@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::{
     mpsc::{self, Receiver, Sender, TryRecvError},
     Arc, Mutex, MutexGuard,
@@ -165,13 +166,16 @@ impl Agent {
             let mut definition = self.definition();
             if definition.state() == AgentState::Working {
                 definition.queue_message(Message::user(content));
-                return;
+            } else {
+                definition.push_message(Message::user(content));
+                definition.set_state(AgentState::Working);
             }
-
-            definition.push_message(Message::user(content));
-            definition.set_state(AgentState::Working);
         }
 
+        // told even about a message that was only queued, so that a thread that
+        // has died — a tool that panicked hard enough to take it — is noticed
+        // here rather than leaving the agent working forever. the loop drains a
+        // command it has no use for, so saying so twice costs nothing
         self.run();
     }
 
@@ -229,17 +233,9 @@ impl AgentInner {
     /// without ever finishing costs a known amount rather than running until
     /// the user notices.
     fn run_turns(&self, commands: &Receiver<AgentCommand>, states: &mut ToolStates) -> bool {
-        // read once rather than each time round: a started agent's files are
-        // not re-read, and caching per run means a reload cannot change the
-        // tools out from under a turn in flight while the turn after it still
-        // picks the new ones up
-        let (tools, dir, max_iterations) = {
+        let settings = {
             let definition = self.definition.lock().expect("mutex error");
-            (
-                definition.tools(),
-                definition.config().dir(),
-                definition.config().max_iterations(),
-            )
+            run_settings(&definition)
         };
 
         let mut iteration: u32 = 0;
@@ -254,6 +250,20 @@ impl AgentInner {
 
             let request = {
                 let mut definition = self.definition.lock().expect("mutex error");
+
+                // checked before anything is taken off the queue: a turn that
+                // gives up here never sends another request, and a message
+                // moved into the conversation now would look answered on screen
+                // while never having reached the model. it stays queued, and
+                // the user's next turn picks it up
+                if iteration >= settings.max_iterations {
+                    definition.set_state(AgentState::Failed(format!(
+                        "the agent did not finish within {} iterations",
+                        settings.max_iterations
+                    )));
+                    return false;
+                }
+
                 // anything the user typed mid turn joins the conversation here,
                 // at the top of the loop, so it is sent with the next request.
                 // it lands after a complete set of tool results and never
@@ -262,15 +272,7 @@ impl AgentInner {
                 definition.take_queued_messages();
                 definition.set_state(AgentState::Working);
 
-                if iteration >= max_iterations {
-                    definition.set_state(AgentState::Failed(format!(
-                        "the agent did not finish within {} iterations",
-                        max_iterations
-                    )));
-                    return false;
-                }
-
-                chat_request(&definition, &tools)
+                chat_request(&definition, &settings)
             };
             iteration += 1;
 
@@ -323,7 +325,7 @@ impl AgentInner {
                     // while the ui reads the definition every tick
                     let results: Vec<ToolResult> = tool_calls
                         .iter()
-                        .map(|call| tools.dispatch(states, &dir, call))
+                        .map(|call| settings.tools.dispatch(states, &settings.dir, call))
                         .collect();
 
                     // every call the model made is answered, in the order it
@@ -391,19 +393,43 @@ fn build_system_prompt(config_files: &ConfigFiles) -> String {
     )
 }
 
+/// Everything a run of the agent loop works from, read once before it starts.
+///
+/// An agent's `config.json` is read when its files are loaded and not again
+/// while it runs, so none of this changes underneath the loop. Reading it all in
+/// one go is what keeps that true of the request as well: a reload part way
+/// through a turn cannot leave one iteration asking a new model for the old
+/// tools, or asking for a model that has just been emptied.
+struct RunSettings {
+    model: String,
+    dir: PathBuf,
+    max_iterations: u32,
+    tools: AgentTools,
+}
+
+fn run_settings(definition: &AgentDefinition) -> RunSettings {
+    let config = definition.config();
+    RunSettings {
+        model: config.model().full_slug(),
+        dir: config.dir(),
+        max_iterations: config.max_iterations(),
+        tools: definition.tools(),
+    }
+}
+
 /// The request for one iteration: the conversation so far, plus the tools the
 /// agent may call. An agent with no tools at all leaves `tools` off the request
 /// entirely — an empty `tools: []` is rejected by some providers.
-fn chat_request(definition: &AgentDefinition, tools: &AgentTools) -> ChatCompletionRequest {
+fn chat_request(definition: &AgentDefinition, settings: &RunSettings) -> ChatCompletionRequest {
     let request = ChatCompletionRequest::new(
-        definition.config().model().full_slug(),
+        settings.model.clone(),
         definition.request_messages(),
     );
-    if tools.is_empty() {
+    if settings.tools.is_empty() {
         return request;
     }
     request
-        .set_tools(tools.definitions())
+        .set_tools(settings.tools.definitions())
         .set_tool_choice(ToolChoice::auto())
 }
 

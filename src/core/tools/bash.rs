@@ -1,5 +1,6 @@
 use std::io::Read;
-use std::process::{Command, ExitStatus, Stdio};
+use std::os::unix::process::CommandExt;
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -166,28 +167,53 @@ impl Stream {
     }
 
     /// How the stream reads in the tool's output.
-    fn render(&self) -> String {
+    ///
+    /// `complete` says whether the reader reached the end of the pipe. When it
+    /// did not, this is everything that had arrived rather than everything there
+    /// was, and it says so: a byte count that looks exact but was measured while
+    /// the command was still writing would have the model reasoning about output
+    /// it never saw all of.
+    fn render(&self, complete: bool) -> String {
         if self.total == 0 {
-            return "(none)".to_string();
+            return if complete {
+                "(none)".to_string()
+            } else {
+                "(nothing yet; the command was still writing)".to_string()
+            };
         }
+
         let mut text = String::from_utf8_lossy(&self.kept).into_owned();
-        if self.total > self.kept.len() {
-            text.push_str(&format!(
-                "\n… truncated, {} more bytes",
-                self.total - self.kept.len()
-            ));
+        let dropped = self.total - self.kept.len();
+        match (dropped > 0, complete) {
+            (true, true) => text.push_str(&format!("\n… truncated, {} more bytes", dropped)),
+            (true, false) => text.push_str(&format!(
+                "\n… truncated, at least {} more bytes, and the command was still writing",
+                dropped
+            )),
+            (false, true) => {}
+            (false, false) => text.push_str("\n… the command was still writing"),
         }
         text
     }
 }
 
 /// Reads `reader` to its end on a thread of its own, into a buffer the caller
-/// can look at whenever it likes.
+/// can look at whenever it likes, until it runs out or `stop` is set.
 ///
 /// A reader is what keeps the command from blocking: a pipe nobody drains fills
 /// after about 64KB and stops the command dead, which a `try_wait` loop would
 /// then sit through until the timeout.
-fn drain(mut reader: impl Read + Send + 'static) -> (Arc<Mutex<Stream>>, Arc<AtomicBool>) {
+///
+/// `stop` is the other half of that. A command can exit while something it
+/// started keeps the pipe open and keeps writing — `bash -c 'yes &'` returns at
+/// once and then writes forever — and a reader with nowhere to put the bytes
+/// would spin at full speed for the life of the process. Once the caller has
+/// stopped listening the reader stops reading, drops its end of the pipe, and
+/// whatever is still writing gets a broken pipe and goes away.
+fn drain(
+    mut reader: impl Read + Send + 'static,
+    stop: Arc<AtomicBool>,
+) -> (Arc<Mutex<Stream>>, Arc<AtomicBool>) {
     let stream = Arc::new(Mutex::new(Stream::new()));
     let done = Arc::new(AtomicBool::new(false));
 
@@ -195,7 +221,7 @@ fn drain(mut reader: impl Read + Send + 'static) -> (Arc<Mutex<Stream>>, Arc<Ato
     let thread_done = Arc::clone(&done);
     thread::spawn(move || {
         let mut chunk = [0u8; 8_192];
-        loop {
+        while !stop.load(Ordering::SeqCst) {
             match reader.read(&mut chunk) {
                 Ok(0) | Err(_) => break,
                 Ok(read) => thread_stream
@@ -210,12 +236,53 @@ fn drain(mut reader: impl Read + Send + 'static) -> (Arc<Mutex<Stream>>, Arc<Ato
     (stream, done)
 }
 
+/// How a command ended.
+enum Outcome {
+    Exited(ExitStatus),
+    /// It outran its timeout and was killed. `group_killed` says whether
+    /// everything it started went with it, because that is the difference
+    /// between telling the model the work stopped and telling it the work may
+    /// still be going.
+    TimedOut { group_killed: bool },
+}
+
+/// Kills the command and everything it started.
+///
+/// The command runs in a process group of its own, so a negative pid reaches
+/// the whole group — `child.kill()` on its own signals only the shell, which
+/// leaves anything it forked running and still writing to the agent's
+/// directory. Signalling a group needs libc, which this crate does not depend
+/// on, so it goes through `kill`; when that is not there the shell is killed on
+/// its own and the model is told as much.
+fn kill_group(child: &mut Child) -> bool {
+    // the child was spawned into its own group, so its pid is the group's id
+    let group = format!("-{}", child.id());
+    let group_killed = Command::new("kill")
+        .arg("-KILL")
+        .arg("--")
+        .arg(&group)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+
+    let _ = child.kill();
+    let _ = child.wait();
+    group_killed
+}
+
 /// Runs `command` in `dir`, killing it once `timeout` has passed.
 ///
 /// A command that fails, and one that has to be killed, both come back as
 /// output rather than as an error: the exit code and whatever it printed before
 /// it was stopped are what the model needs in order to try something else.
-fn run_command(dir: &std::path::Path, command: &str, timeout: Duration) -> Result<ToolOutput, ToolError> {
+fn run_command(
+    dir: &std::path::Path,
+    command: &str,
+    timeout: Duration,
+) -> Result<ToolOutput, ToolError> {
     // `-c` rather than `-lc`: a login shell sources the user's profile, which
     // is slow and prints banner text into stdout the model would have to read
     let mut child = Command::new("bash")
@@ -227,38 +294,53 @@ fn run_command(dir: &std::path::Path, command: &str, timeout: Duration) -> Resul
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        // a group of its own, so a timeout can take out everything the command
+        // started rather than only the shell that started it
+        .process_group(0)
         .spawn()
         .map_err(|err| ToolError::NotStarted {
             error: err.to_string(),
         })?;
 
-    let (stdout, stdout_done) = drain(child.stdout.take().expect("piped stdout"));
-    let (stderr, stderr_done) = drain(child.stderr.take().expect("piped stderr"));
+    // set once this call has stopped listening, which is what stops a reader
+    // spinning on output nobody is going to read
+    let stop = Arc::new(AtomicBool::new(false));
+    let (stdout, stdout_done) = drain(
+        child.stdout.take().expect("piped stdout"),
+        Arc::clone(&stop),
+    );
+    let (stderr, stderr_done) = drain(
+        child.stderr.take().expect("piped stderr"),
+        Arc::clone(&stop),
+    );
 
     let deadline = Instant::now() + timeout;
-    let status: Option<ExitStatus> = loop {
+    let outcome = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
+            Ok(Some(status)) => break Outcome::Exited(status),
             Ok(None) => {}
             Err(err) => {
-                return Err(ToolError::NotStarted {
+                stop.store(true, Ordering::SeqCst);
+                let _ = child.kill();
+                return Err(ToolError::Failed {
                     error: err.to_string(),
-                })
+                });
             }
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            break None;
+            break Outcome::TimedOut {
+                group_killed: kill_group(&mut child),
+            };
         }
         thread::sleep(POLL_INTERVAL);
     };
 
-    // the readers are given a moment to finish, and then read wherever they
-    // got to. they are never joined: a command like `sleep 100 &` exits at once
-    // but leaves a grandchild holding the pipe, so a reader can wait for an end
-    // that never comes. a thread parked on a read costs nothing and goes with
-    // the process
+    // the readers are given a moment to finish what is already in the pipe, and
+    // are then told to stop. they are not joined: a command like `sleep 100 &`
+    // exits at once but leaves a grandchild holding the pipe, and a reader can
+    // be waiting on an end that never comes. telling it to stop is what makes
+    // that wait cost nothing — it wakes on the next byte, or never, and either
+    // way it is not spinning and not holding the pipe open for long
     let grace = Instant::now() + DRAIN_GRACE;
     while Instant::now() < grace {
         if stdout_done.load(Ordering::SeqCst) && stderr_done.load(Ordering::SeqCst) {
@@ -266,25 +348,39 @@ fn run_command(dir: &std::path::Path, command: &str, timeout: Duration) -> Resul
         }
         thread::sleep(POLL_INTERVAL);
     }
+    stop.store(true, Ordering::SeqCst);
 
     let mut lines = Vec::new();
-    match status {
-        Some(status) => match status.code() {
+    match outcome {
+        Outcome::Exited(status) => match status.code() {
             Some(code) => lines.push(format!("exit code: {}", code)),
             None => lines.push("killed by a signal".to_string()),
         },
-        None => lines.push(format!(
-            "timed out after {}s and was killed",
+        // the model acts on what this says, so it says what actually happened:
+        // work that is still running is work it must not assume it undid
+        Outcome::TimedOut { group_killed: true } => lines.push(format!(
+            "timed out after {}s; it and everything it started were killed",
+            timeout.as_secs()
+        )),
+        Outcome::TimedOut { group_killed: false } => lines.push(format!(
+            "timed out after {}s and the shell was killed, but anything it \
+             started may still be running",
             timeout.as_secs()
         )),
     }
     lines.push(format!(
         "stdout:\n{}",
-        stdout.lock().expect("mutex error").render()
+        stdout
+            .lock()
+            .expect("mutex error")
+            .render(stdout_done.load(Ordering::SeqCst))
     ));
     lines.push(format!(
         "stderr:\n{}",
-        stderr.lock().expect("mutex error").render()
+        stderr
+            .lock()
+            .expect("mutex error")
+            .render(stderr_done.load(Ordering::SeqCst))
     ));
 
     Ok(ToolOutput::new(lines.join("\n")))

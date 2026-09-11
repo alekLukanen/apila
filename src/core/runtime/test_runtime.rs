@@ -525,7 +525,14 @@ fn wait_until_settled(rt: &Runtime, id: &str) {
 
 #[test]
 fn the_tools_an_agent_may_call_go_out_with_every_request() {
-    let (dir, server) = project_with_bash("tools-sent", 5, vec![StubReply::text("done")]);
+    let (dir, server) = project_with_bash(
+        "tools-sent",
+        5,
+        vec![
+            StubReply::tool_call("call_1", "bash", serde_json::json!({"command": "true"})),
+            StubReply::text("done"),
+        ],
+    );
     let rt = runtime(&dir);
 
     rt.start_agent("builder").expect("start the agent");
@@ -533,13 +540,17 @@ fn the_tools_an_agent_may_call_go_out_with_every_request() {
         .expect("send a message");
     wait_until_settled(&rt, "builder");
 
-    let request = &server.requests()[0];
-    assert_eq!(
-        sent_tool_names(request),
-        vec!["end_turn".to_string(), "bash".to_string()]
-    );
-    let sent: serde_json::Value = serde_json::from_str(request).expect("a json request");
-    assert_eq!(sent["tool_choice"], serde_json::json!("auto"));
+    let requests = server.requests();
+    assert!(requests.len() >= 2, "a tool loop ran more than one request");
+    for request in &requests {
+        assert_eq!(
+            sent_tool_names(request),
+            vec!["end_turn".to_string(), "bash".to_string()],
+            "an iteration went out without its tools"
+        );
+        let sent: serde_json::Value = serde_json::from_str(request).expect("a json request");
+        assert_eq!(sent["tool_choice"], serde_json::json!("auto"));
+    }
 }
 
 /// `end_turn` is how a turn ends rather than something the user grants, so an
@@ -875,4 +886,249 @@ fn a_tools_state_survives_across_turns() {
         tool_outputs,
         vec!["call 1".to_string(), "call 2".to_string()]
     );
+}
+
+/// A tool that panics takes the agent's thread with it unless the loop catches
+/// it. The agent must come back to the user rather than sitting in `working`
+/// forever with a tool call nothing answered.
+#[test]
+fn a_tool_that_panics_does_not_leave_the_agent_working() {
+    use std::sync::Arc;
+
+    use crate::core::runtime::tool_registry::ToolRegistry;
+    use crate::core::tools::end_turn::EndTurnTool;
+    use crate::core::tools::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolState};
+
+    struct BustedTool;
+
+    impl Tool for BustedTool {
+        fn name(&self) -> String {
+            "busted".into()
+        }
+        fn description(&self) -> String {
+            "panics".into()
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+        fn new_state(&self, _context: &ToolContext) -> Result<Box<dyn ToolState>, ToolError> {
+            Ok(Box::new(BustedState))
+        }
+    }
+
+    struct BustedState;
+
+    impl ToolState for BustedState {
+        fn run(
+            &mut self,
+            _context: &ToolContext,
+            _arguments: &serde_json::Value,
+        ) -> Result<ToolOutput, ToolError> {
+            panic!("the tool went bang")
+        }
+    }
+
+    let (dir, server) = project_with_script(
+        "panicking-tool",
+        vec![
+            StubReply::tool_call("call_1", "busted", serde_json::json!({})),
+            StubReply::text("that did not work"),
+        ],
+    );
+    let builder = agent_dir(&dir, "builder", true);
+    write_agent_config_with_tools(
+        &builder,
+        TEST_MODEL,
+        5,
+        serde_json::json!({"enabled": ["busted"]}),
+    );
+
+    let config = Config::load(&dir).expect("load config");
+    let registry = ToolRegistry::new()
+        .register(Arc::new(EndTurnTool::new()))
+        .register(Arc::new(BustedTool));
+    let rt = Runtime::new_with_tools(RuntimeConfig::new(dir.clone(), config), registry)
+        .expect("build runtime");
+
+    rt.start_agent("builder").expect("start the agent");
+    rt.send_agent_message("builder", "go".into())
+        .expect("send a message");
+    wait_until_settled(&rt, "builder");
+
+    let definition = rt.agent("builder").expect("agent exists");
+    assert_eq!(definition.state(), AgentState::Idle);
+
+    // the call the model made was answered, so the conversation is one a
+    // provider would still accept
+    let tool_messages: Vec<String> = definition
+        .messages()
+        .iter()
+        .filter_map(|message| match message {
+            Message::Tool { content, .. } => Some(content.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(tool_messages.len(), 1);
+    assert!(tool_messages[0].contains("went bang"), "{}", tool_messages[0]);
+    assert_eq!(server.requests().len(), 2);
+}
+
+/// A message the user sent is either sent to the model or still visibly queued.
+/// It must never be moved into the conversation by a turn that then gives up,
+/// which would show it as delivered on screen having never been asked about.
+#[test]
+fn a_message_is_never_shown_as_delivered_without_reaching_the_model() {
+    let (dir, server) = project_with_bash(
+        "queued-at-the-limit",
+        1,
+        vec![StubReply::tool_call(
+            "call_1",
+            "bash",
+            serde_json::json!({"command": "sleep 0.3"}),
+        )],
+    );
+    let rt = runtime(&dir);
+
+    rt.start_agent("builder").expect("start the agent");
+    rt.send_agent_message("builder", "go".into())
+        .expect("send a message");
+    wait_until("the first request", || server.requests().len() == 1);
+    rt.send_agent_message("builder", "also do this".into())
+        .expect("send a message");
+    wait_until_settled(&rt, "builder");
+
+    // the bound was one iteration, so the turn gave up after the first request
+    match rt.agent("builder").expect("agent exists").state() {
+        AgentState::Failed(err) => assert!(err.contains("1 iterations"), "{}", err),
+        other => panic!("expected Failed, got {:?}", other.label()),
+    }
+
+    let definition = rt.agent("builder").expect("agent exists");
+    let sent = server.requests().join("\n");
+    for message in definition.messages() {
+        if let Message::User { content } = message {
+            assert!(
+                sent.contains(content.as_str()),
+                "`{}` is in the conversation but never reached the model",
+                content
+            );
+        }
+    }
+}
+
+/// An agent's settings are read once. Rereading them part way through a session
+/// would leave the model, the tools and the settings its tools already parsed
+/// describing different generations of the same file.
+#[test]
+fn reloading_the_config_of_a_started_agent_is_refused() {
+    let (dir, _server) = project_with_bash("reload-started", 5, vec![StubReply::text("done")]);
+    let rt = runtime(&dir);
+
+    // unstarted, the reload is the ordinary one
+    rt.reload_config_files("builder")
+        .expect("reload before starting");
+
+    rt.start_agent("builder").expect("start the agent");
+
+    let err = rt
+        .reload_config_files("builder")
+        .expect_err("cannot reload a started agent");
+    assert!(matches!(
+        err,
+        RuntimeError::AgentAlreadyStarted(id) if id == "builder"
+    ));
+}
+
+/// A started agent keeps the configuration it started on, so reloading the
+/// project does not even read its files. Observed through the tool settings
+/// check, which only runs when an agent's `tools` block is worked out: the
+/// outcome alone would look the same either way, since the agent is skipped when
+/// the results are applied.
+#[test]
+fn reloading_does_not_read_the_files_of_a_started_agent() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use crate::core::runtime::tool_registry::ToolRegistry;
+    use crate::core::tools::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolState};
+
+    /// Counts how many times its settings have been checked, which is once per
+    /// time the agent's configuration is worked out.
+    struct CountingTool {
+        checked: Arc<AtomicUsize>,
+    }
+
+    impl Tool for CountingTool {
+        fn name(&self) -> String {
+            "counting".into()
+        }
+        fn description(&self) -> String {
+            "counts".into()
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+        fn always_enabled(&self) -> bool {
+            true
+        }
+        fn validate_config(&self, _config: &serde_json::Value) -> Result<(), String> {
+            self.checked.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn new_state(&self, _context: &ToolContext) -> Result<Box<dyn ToolState>, ToolError> {
+            Ok(Box::new(CountingState))
+        }
+    }
+
+    struct CountingState;
+
+    impl ToolState for CountingState {
+        fn run(
+            &mut self,
+            _context: &ToolContext,
+            _arguments: &serde_json::Value,
+        ) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::new("counted"))
+        }
+    }
+
+    let (dir, _server) = project_with_script("reload-not-read", vec![StubReply::text("done")]);
+    agent_dir(&dir, "builder", true);
+
+    let checked = Arc::new(AtomicUsize::new(0));
+    let config = Config::load(&dir).expect("load config");
+    let registry = ToolRegistry::new().register(Arc::new(CountingTool {
+        checked: Arc::clone(&checked),
+    }));
+    let rt = Runtime::new_with_tools(RuntimeConfig::new(dir.clone(), config), registry)
+        .expect("build runtime");
+
+    // building the runtime loaded the agent once
+    assert_eq!(checked.load(Ordering::SeqCst), 1);
+    rt.start_agent("builder").expect("start the agent");
+
+    let before = rt.agent("builder").expect("agent exists").tools().names();
+
+    // the file is left perfectly good, so anything that did read it would get
+    // as far as checking the settings and be counted
+    rt.load_agents();
+    assert_eq!(
+        checked.load(Ordering::SeqCst),
+        1,
+        "the files of a started agent were read again"
+    );
+
+    // and a file that has since become unusable cannot take the conversation
+    // down with it either
+    fs::write(
+        dir.join("builder").join(AGENT_CONFIG_FILE_NAME),
+        "{ not json",
+    )
+    .expect("write agent config");
+    rt.load_agents();
+
+    let definition = rt.agent("builder").expect("agent exists");
+    assert_eq!(definition.state(), AgentState::Idle);
+    assert!(definition.config_error().is_none());
+    assert_eq!(definition.tools().names(), before);
 }

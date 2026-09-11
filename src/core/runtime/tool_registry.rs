@@ -9,7 +9,7 @@ use crate::core::openrouter::types::{Message, ToolCall};
 use crate::core::runtime::agent_config::ToolSettings;
 use crate::core::tools::bash::BashTool;
 use crate::core::tools::end_turn::EndTurnTool;
-use crate::core::tools::tool::{Tool, ToolContext, ToolState};
+use crate::core::tools::tool::{catching_panics, Tool, ToolContext, ToolOutput, ToolState};
 
 /// Why an agent's `tools` block could not be turned into a set of tools it can
 /// call. Every one of these stops the agent being configured, the same way a
@@ -21,6 +21,9 @@ pub enum ToolSettingsError {
 
     #[error("more than one config for `{0}`")]
     DuplicateToolConfig(String),
+
+    #[error("there is a config for `{name}`, which is not a tool. the tools are: {available}")]
+    UnknownToolConfig { name: String, available: String },
 
     #[error("the config for `{tool}` is not usable: {error}")]
     InvalidToolConfig { tool: String, error: String },
@@ -72,6 +75,11 @@ impl ToolRegistry {
             .map(Arc::clone)
     }
 
+    /// Every registered tool's name.
+    pub fn names(&self) -> Vec<String> {
+        self.tools.iter().map(|tool| tool.name()).collect()
+    }
+
     /// Every name a `config.json` may put in `enabled`, which is every
     /// registered tool that is not already on for everyone.
     pub fn enableable_names(&self) -> Vec<String> {
@@ -91,10 +99,27 @@ impl ToolRegistry {
     pub fn resolve(&self, settings: &ToolSettings) -> Result<AgentTools, ToolSettingsError> {
         let mut configs: HashMap<String, serde_json::Value> = HashMap::new();
         for config in &settings.configs {
-            if configs
-                .insert(config.tool.clone(), config.settings_value())
-                .is_some()
-            {
+            // a config naming a tool this runtime has never heard of is a typo,
+            // not a setting waiting to be switched on. left alone it does
+            // nothing at all, quietly, which is the worst of both
+            let tool = self
+                .tool(&config.tool)
+                .ok_or_else(|| ToolSettingsError::UnknownToolConfig {
+                    name: config.tool.clone(),
+                    available: self.names().join(", "),
+                })?;
+
+            let settings_value = config.settings_value();
+            // checked whether or not the tool is enabled, so switching one on
+            // later cannot turn up settings that were wrong all along
+            tool.validate_config(&settings_value).map_err(|error| {
+                ToolSettingsError::InvalidToolConfig {
+                    tool: config.tool.clone(),
+                    error,
+                }
+            })?;
+
+            if configs.insert(config.tool.clone(), settings_value).is_some() {
                 return Err(ToolSettingsError::DuplicateToolConfig(config.tool.clone()));
             }
         }
@@ -125,8 +150,8 @@ impl ToolRegistry {
 
         let mut tools = Vec::with_capacity(chosen.len());
         for tool in chosen {
-            // a config for a tool that is not enabled is left alone: it is a
-            // setting waiting to be switched on, not a mistake
+            // a tool the agent enabled without settings of its own still has to
+            // be happy with having none
             let config = configs
                 .get(&tool.name())
                 .cloned()
@@ -221,14 +246,9 @@ impl AgentTools {
         };
 
         let context = ToolContext::new(dir.to_path_buf(), config.clone());
-        let state = match states.state(tool, &context) {
-            Ok(state) => state,
-            Err(err) => return ToolResult::error(call, err.to_string()),
-        };
-
-        match state.run(&context, &arguments) {
+        match states.run(tool, &context, &arguments) {
             Ok(output) => ToolResult::new(call, output),
-            Err(err) => ToolResult::error(call, err.to_string()),
+            Err(err) => ToolResult::error(call, err),
         }
     }
 }
@@ -262,6 +282,12 @@ fn parse_arguments(raw: &str) -> Result<serde_json::Value, String> {
 /// A state is created the first time the agent calls its tool rather than when
 /// the agent starts, so a tool that opens a connection does not open one for an
 /// agent that never gets round to using it.
+///
+/// Nothing rebuilds a state once it exists, which means whatever it read out of
+/// its config when it started is what it runs on for the rest of the agent's
+/// life. That is not a staleness problem: an agent's `config.json` is read once,
+/// when its files are loaded, and `Runtime::reload_config_files` refuses a
+/// started agent for exactly this reason.
 pub struct ToolStates {
     states: HashMap<String, Box<dyn ToolState>>,
 }
@@ -279,22 +305,41 @@ impl ToolStates {
         }
     }
 
-    /// The state for `tool`, started if it has not been yet.
+    /// Runs one call against the state this agent keeps for `tool`, starting
+    /// that state if this is the first time the agent has reached for it.
+    ///
+    /// Returns the reason as text rather than a `ToolError`, because a panic is
+    /// one of the things that can come back and it is not one.
     ///
     /// A failure to start is not remembered: the next call tries again, so a
     /// connection that was refused once does not leave the tool broken for the
-    /// rest of the agent's life.
-    fn state(
+    /// rest of the agent's life. Neither is a state that panicked kept — it may
+    /// be halfway through whatever it was doing, so it is dropped and the next
+    /// call starts a fresh one.
+    fn run(
         &mut self,
         tool: &Arc<dyn Tool>,
         context: &ToolContext,
-    ) -> Result<&mut Box<dyn ToolState>, crate::core::tools::tool::ToolError> {
+        arguments: &serde_json::Value,
+    ) -> Result<ToolOutput, String> {
         let name = tool.name();
+
         if !self.states.contains_key(&name) {
-            let state = tool.new_state(context)?;
+            let started = catching_panics(|| tool.new_state(context))
+                .map_err(|panic| format!("the tool panicked while starting: {}", panic))?;
+            let state = started.map_err(|err| err.to_string())?;
             self.states.insert(name.clone(), state);
         }
-        Ok(self.states.get_mut(&name).expect("just inserted"))
+
+        let state = self.states.get_mut(&name).expect("just inserted");
+        match catching_panics(|| state.run(context, arguments)) {
+            Ok(Ok(output)) => Ok(output),
+            Ok(Err(err)) => Err(err.to_string()),
+            Err(panic) => {
+                self.states.remove(&name);
+                Err(format!("the tool panicked: {}", panic))
+            }
+        }
     }
 
     /// The tools this agent has actually reached for so far.
