@@ -1,6 +1,6 @@
 pub mod agent;
 pub mod agent_config;
-mod helpers;
+pub(crate) mod helpers;
 pub mod runtime;
 pub mod tool_registry;
 

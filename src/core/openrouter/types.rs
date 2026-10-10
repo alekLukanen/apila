@@ -411,3 +411,54 @@ pub struct ApiError {
     #[serde(default)]
     pub metadata: Option<serde_json::Value>,
 }
+
+// Embeddings ////////////////////////
+//////////////////////////////////////
+
+/// A request to `/embeddings`, one vector per entry of `input`.
+#[derive(Debug, Clone, Serialize)]
+pub struct EmbeddingRequest {
+    pub model: String,
+    pub input: Vec<String>,
+}
+
+impl EmbeddingRequest {
+    pub fn new(model: impl Into<String>, input: Vec<String>) -> EmbeddingRequest {
+        EmbeddingRequest {
+            model: model.into(),
+            input,
+        }
+    }
+
+    /// Catches a request the api would refuse before it costs a round trip.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.model.trim() == "" {
+            return Err("model must not be empty".into());
+        }
+        if self.input.is_empty() {
+            return Err("input must contain at least one text".into());
+        }
+        if self.input.iter().any(|text| text.trim() == "") {
+            return Err("input must not contain an empty text".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EmbeddingResponse {
+    #[serde(default)]
+    pub data: Vec<EmbeddingData>,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub usage: Option<Usage>,
+}
+
+/// One input's vector. `index` is its position in the request's `input`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct EmbeddingData {
+    #[serde(default)]
+    pub index: usize,
+    pub embedding: Vec<f32>,
+}

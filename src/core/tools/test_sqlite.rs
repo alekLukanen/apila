@@ -1,14 +1,21 @@
-use std::path::PathBuf;
+use std::fs;
+use std::path::Path;
 
-use super::sqlite::{SqliteTool, MAX_OUTPUT_BYTES};
+use super::sqlite::{SqliteTool, DATABASES_DIR, MAX_OUTPUT_BYTES};
 use super::tool::{Tool, ToolContext, ToolError, ToolState};
 use crate::core::runtime::agent_config::ToolSettings;
 use crate::core::runtime::tool_registry::ToolRegistry;
+use crate::core::test_support::scratch_dir;
 
-/// A started sqlite tool, configured with `config`. The tool never touches
-/// disk, so the directory it is handed does not need to exist.
+/// A started sqlite tool, configured with `config`, in a directory of its own.
 fn state(config: serde_json::Value) -> (ToolContext, Box<dyn ToolState>) {
-    let context = ToolContext::new(PathBuf::from("/nonexistent"), config);
+    state_in(&scratch_dir(), config)
+}
+
+/// A started sqlite tool working in the agent directory `dir`, which is how a
+/// later session finds the databases an earlier one saved.
+fn state_in(dir: &Path, config: serde_json::Value) -> (ToolContext, Box<dyn ToolState>) {
+    let context = ToolContext::new(dir.to_path_buf(), config);
     let state = SqliteTool::new()
         .new_state(&context)
         .expect("start the tool");
@@ -230,7 +237,7 @@ fn a_dropped_database_is_gone_and_the_error_names_what_is_left() {
         serde_json::json!({"action": "query", "database": "db", "sql": "SELECT 1"}),
     );
     assert!(
-        error.to_string().contains("the open databases are: kept"),
+        error.to_string().contains("the databases are: kept"),
         "{error}"
     );
 }
@@ -701,4 +708,179 @@ fn a_script_stopped_part_way_keeps_none_of_it() {
         serde_json::json!({"action": "query", "database": "db", "sql": "SELECT count(*) AS n FROM t"}),
     );
     assert_eq!(content, "n\n0\n1 row");
+}
+
+// Saved on disk /////////////////////
+//////////////////////////////////////
+
+#[test]
+fn a_database_is_saved_in_the_agent_s_directory() {
+    let dir = scratch_dir();
+    let (context, mut state) = state_in(&dir, serde_json::json!({}));
+    ok(
+        &context,
+        &mut state,
+        serde_json::json!({"action": "create", "database": "notes"}),
+    );
+
+    assert!(dir.join(DATABASES_DIR).join("notes.db").is_file());
+}
+
+#[test]
+fn rows_are_still_there_in_a_later_session() {
+    let dir = scratch_dir();
+    {
+        let (context, mut state) = state_in(&dir, serde_json::json!({}));
+        ok(
+            &context,
+            &mut state,
+            serde_json::json!({"action": "create", "database": "db"}),
+        );
+        ok(
+            &context,
+            &mut state,
+            serde_json::json!({
+                "action": "execute",
+                "database": "db",
+                "sql": "CREATE TABLE people (name TEXT); INSERT INTO people VALUES ('ada');"
+            }),
+        );
+        ok(
+            &context,
+            &mut state,
+            serde_json::json!({"action": "create", "database": "empty"}),
+        );
+    }
+
+    // a new state is what the next session starts with
+    let (context, mut state) = state_in(&dir, serde_json::json!({}));
+    assert_eq!(
+        ok(&context, &mut state, serde_json::json!({"action": "list"})),
+        "db (1 table)\nempty (0 tables)"
+    );
+    assert_eq!(
+        ok(
+            &context,
+            &mut state,
+            serde_json::json!({"action": "query", "database": "db", "sql": "SELECT name FROM people"})
+        ),
+        "name\nada\n1 row"
+    );
+}
+
+#[test]
+fn a_dropped_database_is_deleted_from_disk() {
+    let dir = scratch_dir();
+    let (context, mut state) = state_in(&dir, serde_json::json!({}));
+    ok(
+        &context,
+        &mut state,
+        serde_json::json!({"action": "create", "database": "db"}),
+    );
+    ok(
+        &context,
+        &mut state,
+        serde_json::json!({"action": "execute", "database": "db", "sql": "CREATE TABLE t (x)"}),
+    );
+    ok(
+        &context,
+        &mut state,
+        serde_json::json!({"action": "drop", "database": "db"}),
+    );
+
+    let left: Vec<_> = fs::read_dir(dir.join(DATABASES_DIR))
+        .expect("read databases dir")
+        .flatten()
+        .map(|entry| entry.file_name())
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+
+    let (context, mut state) = state_in(&dir, serde_json::json!({}));
+    assert_eq!(
+        ok(&context, &mut state, serde_json::json!({"action": "list"})),
+        "(no databases)"
+    );
+}
+
+#[test]
+fn a_name_saved_by_an_earlier_session_cannot_be_created_again() {
+    let dir = scratch_dir();
+    {
+        let (context, mut state) = state_in(&dir, serde_json::json!({}));
+        ok(
+            &context,
+            &mut state,
+            serde_json::json!({"action": "create", "database": "db"}),
+        );
+    }
+
+    let (context, mut state) = state_in(&dir, serde_json::json!({}));
+    let error = err(
+        &context,
+        &mut state,
+        serde_json::json!({"action": "create", "database": "db"}),
+    );
+    assert!(error.to_string().contains("already exists"), "{error}");
+}
+
+#[test]
+fn max_databases_counts_the_ones_saved_by_earlier_sessions() {
+    let dir = scratch_dir();
+    {
+        let (context, mut state) = state_in(&dir, serde_json::json!({}));
+        ok(
+            &context,
+            &mut state,
+            serde_json::json!({"action": "create", "database": "first"}),
+        );
+    }
+
+    let (context, mut state) = state_in(&dir, serde_json::json!({"max_databases": 1}));
+    let error = err(
+        &context,
+        &mut state,
+        serde_json::json!({"action": "create", "database": "second"}),
+    );
+    assert!(matches!(error, ToolError::Rejected { .. }), "{error:?}");
+    assert!(
+        error.to_string().contains("1 databases are saved"),
+        "{error}"
+    );
+}
+
+#[test]
+fn files_that_are_not_databases_are_not_listed() {
+    let dir = scratch_dir();
+    let databases = dir.join(DATABASES_DIR);
+    fs::create_dir_all(&databases).expect("create databases dir");
+    fs::write(databases.join("bad name.db"), "").expect("write file");
+    fs::write(databases.join("notes.txt"), "").expect("write file");
+    fs::write(databases.join("db.db-wal"), "").expect("write file");
+
+    let (context, mut state) = state_in(&dir, serde_json::json!({}));
+    assert_eq!(
+        ok(&context, &mut state, serde_json::json!({"action": "list"})),
+        "(no databases)"
+    );
+}
+
+#[test]
+fn attach_and_detach_are_refused() {
+    let (context, mut state) = with_people();
+
+    for sql in [
+        "ATTACH DATABASE '/tmp/other.db' AS other",
+        "attach '/tmp/other.db' as other",
+        "SELECT 1; DETACH DATABASE other",
+    ] {
+        let error = err(
+            &context,
+            &mut state,
+            serde_json::json!({"action": "execute", "database": "db", "sql": sql}),
+        );
+        assert!(
+            matches!(error, ToolError::InvalidArgument { ref argument, .. } if argument == "sql"),
+            "{sql}: {error:?}"
+        );
+    }
 }

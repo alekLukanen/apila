@@ -4,9 +4,11 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{backend::TestBackend, Terminal};
 
 use crate::core::openrouter::types::Message;
+use std::time::Duration;
+
 use crate::core::test_support::{
-    agent_dir, project_dir, project_with_server, wait_until, write_agent_config_json,
-    write_directive,
+    agent_dir, project_dir, project_with_delayed_server, project_with_server, wait_until,
+    write_agent_config_json, write_directive,
 };
 
 use super::app::{Args, TUIApp};
@@ -150,6 +152,76 @@ fn without_a_reasoning_effort_only_the_model_is_shown() {
     assert!(!screen.contains("openai/gpt-4o ("), "{}", screen);
 }
 
+// Clearing //////////////////////////
+//////////////////////////////////////
+
+fn type_line(app: &mut TUIApp, text: &str) {
+    for c in text.chars() {
+        press(app, KeyCode::Char(c));
+    }
+    press(app, KeyCode::Enter);
+}
+
+fn screen(term: &mut Terminal<TestBackend>, app: &mut TUIApp) -> String {
+    term.draw(|frame| app.draw(frame)).expect("draw");
+    format!("{}", term.backend())
+}
+
+#[test]
+fn typing_clear_starts_a_new_session_rather_than_sending_it() {
+    let (dir, server) = project_with_server("app-clear", "the answer");
+    agent_dir(&dir, "worker", true);
+    let mut term = Terminal::new(TestBackend::new(120, 40)).expect("terminal");
+    let mut app = app(&dir);
+
+    // no directive, so <Enter> opens the chat and waits for the user
+    press(&mut app, KeyCode::Enter);
+    type_line(&mut app, "the question");
+    // the reply is on screen a moment before the turn is over
+    wait_until("the reply on screen and the agent idle", || {
+        let shown = screen(&mut term, &mut app);
+        shown.contains("the answer") && shown.contains("State:     idle")
+    });
+
+    type_line(&mut app, "/clear");
+    assert!(screen(&mut term, &mut app).contains("session cleared"));
+    wait_until("the old conversation to go", || {
+        !screen(&mut term, &mut app).contains("the answer")
+    });
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[test]
+fn a_clear_typed_mid_turn_is_shown_queued_with_what_follows_it() {
+    let (dir, _server) =
+        project_with_delayed_server("app-clear-queued", "the answer", Duration::from_millis(300));
+    agent_dir(&dir, "worker", true);
+    let mut term = Terminal::new(TestBackend::new(120, 40)).expect("terminal");
+    let mut app = app(&dir);
+
+    press(&mut app, KeyCode::Enter);
+    type_line(&mut app, "the question");
+    type_line(&mut app, "/clear");
+    let shown = screen(&mut term, &mut app);
+    assert!(
+        shown.contains("clear queued — runs when this turn ends"),
+        "{shown}"
+    );
+
+    type_line(&mut app, "a fresh start");
+    let shown = screen(&mut term, &mut app);
+    assert!(shown.contains("next session"), "{shown}");
+    assert!(shown.contains("a fresh start"), "{shown}");
+
+    // once the turn ends the new session opens on what was sent after the clear
+    wait_until("the new session", || {
+        let shown = screen(&mut term, &mut app);
+        !shown.contains("the question")
+            && shown.contains("a fresh start")
+            && shown.contains("the answer")
+    });
+}
+
 // Wrapping //////////////////////////
 //////////////////////////////////////
 
@@ -167,7 +239,11 @@ fn a_run_of_characters_with_nothing_to_wrap_on_is_still_broken_up() {
     let lines = TUIApp::wrap(&"a".repeat(25), 10);
 
     assert_eq!(lines.len(), 3);
-    assert!(lines.iter().all(|line| line.chars().count() <= 10), "{:?}", lines);
+    assert!(
+        lines.iter().all(|line| line.chars().count() <= 10),
+        "{:?}",
+        lines
+    );
     assert_eq!(lines.concat(), "a".repeat(25));
 }
 
@@ -192,7 +268,11 @@ fn wrapping_never_returns_a_line_wider_than_it_was_asked_for() {
 fn wrapping_to_no_width_at_all_still_finishes() {
     let lines = TUIApp::wrap("abc def", 0);
 
-    assert!(lines.iter().all(|line| line.chars().count() <= 1), "{:?}", lines);
+    assert!(
+        lines.iter().all(|line| line.chars().count() <= 1),
+        "{:?}",
+        lines
+    );
 }
 
 /// Characters wider than a byte must not be cut in the middle.
@@ -201,7 +281,11 @@ fn wrapping_breaks_between_characters_rather_than_inside_one() {
     let lines = TUIApp::wrap(&"é".repeat(10), 4);
 
     assert_eq!(lines.concat(), "é".repeat(10));
-    assert!(lines.iter().all(|line| line.chars().count() <= 4), "{:?}", lines);
+    assert!(
+        lines.iter().all(|line| line.chars().count() <= 4),
+        "{:?}",
+        lines
+    );
 }
 
 /// The transcript shows the head of a long tool result and says how much more
@@ -214,7 +298,12 @@ fn a_long_tool_result_is_capped_in_the_transcript() {
     let lines = TUIApp::message_lines(&message, 40, false);
     let rendered: Vec<String> = lines
         .iter()
-        .map(|line| line.spans.iter().map(|span| span.content.to_string()).collect())
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.to_string())
+                .collect()
+        })
         .collect();
 
     // the label, the lines it kept, the note, and the blank line after
@@ -311,7 +400,10 @@ fn a_long_run_of_spaces_is_still_broken_up() {
     let lines = TUIApp::wrap(&" ".repeat(25), 10);
 
     assert_eq!(lines.len(), 3);
-    assert!(lines.iter().all(|line| line.chars().count() <= 10), "{:?}", lines);
+    assert!(
+        lines.iter().all(|line| line.chars().count() <= 10),
+        "{:?}",
+        lines
+    );
     assert_eq!(lines.concat(), " ".repeat(25));
 }
-

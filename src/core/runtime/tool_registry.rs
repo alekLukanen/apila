@@ -5,10 +5,13 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
+use crate::core::memory::store::MemoryStore;
+use crate::core::openrouter::client::OpenRouter;
 use crate::core::openrouter::types::{Message, ToolCall};
-use crate::core::runtime::agent_config::ToolSettings;
+use crate::core::runtime::agent_config::{ToolSettings, SKILL_TOOL_NAMES};
 use crate::core::tools::bash::BashTool;
 use crate::core::tools::end_turn::EndTurnTool;
+use crate::core::tools::skills::{GetSkillTool, SearchSkillsTool};
 use crate::core::tools::sqlite::SqliteTool;
 use crate::core::tools::tool::{catching_panics, Tool, ToolContext, ToolOutput, ToolState};
 use crate::core::tools::webpage::{FetchWebpageTool, ReadWebpageDataTool};
@@ -58,6 +61,8 @@ impl ToolRegistry {
             .register(Arc::new(SqliteTool::new()))
             .register(Arc::new(FetchWebpageTool::new()))
             .register(Arc::new(ReadWebpageDataTool::new()))
+            .register(Arc::new(SearchSkillsTool::new()))
+            .register(Arc::new(GetSkillTool::new()))
     }
 
     /// Adds a tool, replacing one already registered under the same name so a
@@ -82,11 +87,13 @@ impl ToolRegistry {
     }
 
     /// Every name a `config.json` may put in `enabled`, which is every
-    /// registered tool that is not already on for everyone.
+    /// registered tool that is not already on for everyone or switched on by
+    /// `memory.skills`.
     pub fn enableable_names(&self) -> Vec<String> {
         self.tools
             .iter()
             .filter(|tool| !tool.always_enabled())
+            .filter(|tool| !SKILL_TOOL_NAMES.contains(&tool.name().as_str()))
             .map(|tool| tool.name())
             .collect()
     }
@@ -99,12 +106,12 @@ impl ToolRegistry {
             // a config naming a tool this runtime has never heard of is a typo,
             // not a setting waiting to be switched on. left alone it does
             // nothing at all, quietly, which is the worst of both
-            let tool = self
-                .tool(&config.tool)
-                .ok_or_else(|| ToolSettingsError::UnknownToolConfig {
-                    name: config.tool.clone(),
-                    available: self.names().join(", "),
-                })?;
+            let tool =
+                self.tool(&config.tool)
+                    .ok_or_else(|| ToolSettingsError::UnknownToolConfig {
+                        name: config.tool.clone(),
+                        available: self.names().join(", "),
+                    })?;
 
             let settings_value = config.settings_value();
             // checked whether or not the tool is enabled, so switching one on
@@ -116,7 +123,10 @@ impl ToolRegistry {
                 }
             })?;
 
-            if configs.insert(config.tool.clone(), settings_value).is_some() {
+            if configs
+                .insert(config.tool.clone(), settings_value)
+                .is_some()
+            {
                 return Err(ToolSettingsError::DuplicateToolConfig(config.tool.clone()));
             }
         }
@@ -153,11 +163,12 @@ impl ToolRegistry {
                 .get(&tool.name())
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!({}));
-            tool.validate_config(&config)
-                .map_err(|error| ToolSettingsError::InvalidToolConfig {
+            tool.validate_config(&config).map_err(|error| {
+                ToolSettingsError::InvalidToolConfig {
                     tool: tool.name(),
                     error,
-                })?;
+                }
+            })?;
             tools.push((tool, config));
         }
 
@@ -233,7 +244,9 @@ impl AgentTools {
             Err(err) => return ToolResult::error(call, err),
         };
 
-        let context = ToolContext::new(dir.to_path_buf(), config.clone());
+        let context = ToolContext::new(dir.to_path_buf(), config.clone())
+            .set_openrouter(states.openrouter.clone())
+            .set_memory(states.memory.clone());
         match states.run(tool, &context, &arguments) {
             Ok(output) => ToolResult::new(call, output),
             Err(err) => ToolResult::error(call, err),
@@ -261,6 +274,10 @@ fn parse_arguments(raw: &str) -> Result<serde_json::Value, String> {
 /// rebuilt, which is why a started agent's config cannot be reloaded.
 pub struct ToolStates {
     states: HashMap<String, Box<dyn ToolState>>,
+    /// Handed to every call, for the tools that reach a model or the agent's
+    /// memory themselves.
+    openrouter: Option<Arc<OpenRouter>>,
+    memory: Option<Arc<MemoryStore>>,
 }
 
 impl Debug for ToolStates {
@@ -273,7 +290,21 @@ impl ToolStates {
     pub fn new() -> ToolStates {
         ToolStates {
             states: HashMap::new(),
+            openrouter: None,
+            memory: None,
         }
+    }
+
+    pub fn set_openrouter(&mut self, openrouter: Arc<OpenRouter>) {
+        self.openrouter = Some(openrouter);
+    }
+
+    pub fn set_memory(&mut self, memory: Arc<MemoryStore>) {
+        self.memory = Some(memory);
+    }
+
+    pub fn has_memory(&self) -> bool {
+        self.memory.is_some()
     }
 
     /// Errors are text because a panic can be one. A state that failed to

@@ -1,4 +1,5 @@
 pub mod config;
+pub mod memory;
 pub mod openrouter;
 pub mod runtime;
 pub mod tools;

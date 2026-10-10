@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use crate::core::memory::writer::WriterHandle;
 use crate::core::openrouter::client::{OpenRouter, OpenRouterConfig};
 use crate::core::openrouter::types::Message;
 use crate::core::runtime::agent_config::{AgentConfig, ConfigFiles, ConfigFilesError, Model};
@@ -22,7 +23,12 @@ fn agent(name: &str) -> Agent {
         .set_dir(PathBuf::from(name));
     let openrouter =
         OpenRouter::new(OpenRouterConfig::new("sk-or-test".into())).expect("build client");
-    Agent::new(name.to_string(), config, Arc::new(openrouter))
+    Agent::new(
+        name.to_string(),
+        config,
+        Arc::new(openrouter),
+        WriterHandle::detached("test".into()),
+    )
 }
 
 /// A `ConfigFilesError` to hand to an agent, standing in for whatever went
@@ -184,7 +190,12 @@ fn a_dropped_agent_stops_rather_than_working_through_its_queue() {
         .set_model(config_files.model())
         .set_dir(dir);
 
-    let agent = Agent::new("builder".into(), config, Arc::new(openrouter));
+    let agent = Agent::new(
+        "builder".into(),
+        config,
+        Arc::new(openrouter),
+        WriterHandle::detached("test".into()),
+    );
     agent
         .definition()
         .set_config_files(config_files, AgentTools::empty());

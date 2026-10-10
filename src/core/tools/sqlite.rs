@@ -1,13 +1,18 @@
 use std::collections::BTreeMap;
+use std::fs;
+use std::io::ErrorKind;
 use std::num::NonZero;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use turso_core::{
-    Connection, Database, LimboError, MemoryIO, NonNan, Numeric, OpenOptions, SqliteDialect,
-    Statement, StepResult, Value,
+    Connection, Database, LimboError, NonNan, Numeric, OpenFlags, OpenOptions, PlatformIO,
+    SqliteDialect, Statement, StepResult, Value,
 };
+use turso_parser::ast::{Cmd, Stmt};
 
 use crate::core::tools::tool::{
     required_string, Tool, ToolContext, ToolError, ToolOutput, ToolState,
@@ -29,11 +34,14 @@ pub const MAX_OUTPUT_BYTES: usize = 8_192;
 /// how the model learns that it is not seeing every row.
 const ROW_BYTES: usize = MAX_OUTPUT_BYTES - 256;
 
-const MAX_NAME_LENGTH: usize = 64;
+pub(crate) const MAX_NAME_LENGTH: usize = 64;
 
-/// In-memory sqlite databases an agent can create, fill and query; gone when
-/// apila exits. Built on `turso_core` because only the engine can stop a slow
-/// statement. One tool, not one per action, so every action sees the same state.
+/// Where an agent's databases are kept, inside its own directory.
+pub const DATABASES_DIR: &str = "databases";
+
+/// Sqlite databases an agent can create, fill and query, saved in its own
+/// directory so later sessions still have them. Built on `turso_core` because
+/// only the engine can stop a slow statement.
 pub struct SqliteTool;
 
 impl SqliteTool {
@@ -48,7 +56,8 @@ impl SqliteTool {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SqliteSettings {
-    /// Counts only the databases open now, so dropping one frees its place.
+    /// Counts every database saved in the agent's directory, from this session
+    /// or an earlier one, so dropping one frees its place.
     #[serde(default = "default_max_databases")]
     pub max_databases: usize,
 
@@ -104,12 +113,12 @@ impl Tool for SqliteTool {
     }
 
     fn description(&self) -> String {
-        "Create and query sqlite databases of your own. They last for this \
-         session: they are held in memory, never written to disk, and gone \
-         when the session ends, so use them as scratch space for loading and \
-         analysing data, not for keeping anything. Start with `create`, build \
-         tables and load rows with `execute`, read them back with `query`, and \
-         use `list` and `schema` to see what you already have. Every call runs \
+        "Create and query sqlite databases of your own. They are saved in your \
+         directory and are still there in later sessions, so call `list` first \
+         to see what you already have and reuse it, and `drop` what you no \
+         longer need: only a limited number may be kept. Start with `create`, \
+         build tables and load rows with `execute`, read them back with \
+         `query`, and use `schema` to see a database's tables. Every call runs \
          in a transaction of its own and is undone completely if any part of \
          it fails or it runs past the configured timeout, so do not write \
          BEGIN, COMMIT or ROLLBACK. Pass values through `params` rather than \
@@ -125,7 +134,7 @@ impl Tool for SqliteTool {
                 "action": {
                     "type": "string",
                     "enum": ["create", "drop", "list", "schema", "execute", "query"],
-                    "description": "`create` opens a new empty database, `drop` deletes one, `list` names the open databases, `schema` shows a database's tables, indexes and views, `execute` runs statements that change things (CREATE, INSERT, UPDATE, DELETE), and `query` runs one statement and returns the rows it produces."
+                    "description": "`create` makes a new empty database, `drop` deletes one for good, `list` names the saved databases, `schema` shows a database's tables, indexes and views, `execute` runs statements that change things (CREATE, INSERT, UPDATE, DELETE), and `query` runs one statement and returns the rows it produces."
                 },
                 "database": {
                     "type": "string",
@@ -152,26 +161,62 @@ impl Tool for SqliteTool {
     fn new_state(&self, context: &ToolContext) -> Result<Box<dyn ToolState>, ToolError> {
         let settings = SqliteSettings::parse(&context.config())
             .map_err(|error| ToolError::InvalidConfig { error })?;
+        let dir = context.dir().join(DATABASES_DIR);
+        let databases = saved_databases(&dir)
+            .map_err(|err| ToolError::NotStarted {
+                error: format!("the saved databases could not be listed: {}", err),
+            })?
+            .into_iter()
+            .map(|name| (name, None))
+            .collect();
         Ok(Box::new(SqliteState {
             settings,
-            databases: BTreeMap::new(),
+            io: Arc::new(PlatformIO::new().map_err(failed)?),
+            dir,
+            databases,
         }))
     }
 }
 
+/// The names of the databases saved in `dir`. A file whose name is not one
+/// `create` could have made is not one of them.
+fn saved_databases(dir: &Path) -> std::io::Result<Vec<String>> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err),
+    };
+    let mut names = Vec::new();
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("db") {
+            continue;
+        }
+        if let Some(name) = path.file_stem().and_then(|stem| stem.to_str()) {
+            if valid_name(name) {
+                names.push(name.to_string());
+            }
+        }
+    }
+    Ok(names)
+}
+
 /// One database the agent has open. The `Database` is held alongside its
-/// connection so the memory behind it lives exactly as long as this entry does.
+/// connection so the file stays open exactly as long as this entry does.
 struct OpenDatabase {
     _database: Arc<Database>,
     connection: Arc<Connection>,
 }
 
-/// What the tool keeps for one agent: its settings and every database the
-/// agent has created, by name. Kept sorted so `list` reads the same from one
-/// call to the next.
+/// What the tool keeps for one agent: its settings and every saved database,
+/// by name, opened the first time a call needs it. Kept sorted so `list`
+/// reads the same from one call to the next.
 pub struct SqliteState {
     settings: SqliteSettings,
-    databases: BTreeMap<String, OpenDatabase>,
+    io: Arc<PlatformIO>,
+    /// The agent's databases directory.
+    dir: PathBuf,
+    databases: BTreeMap<String, Option<OpenDatabase>>,
 }
 
 impl ToolState for SqliteState {
@@ -202,7 +247,8 @@ impl ToolState for SqliteState {
 impl SqliteState {
     fn create(&mut self, arguments: &serde_json::Value) -> Result<String, ToolError> {
         let name = database_name(arguments)?;
-        if self.databases.contains_key(name) {
+        let path = self.path(name);
+        if self.databases.contains_key(name) || path.exists() {
             return Err(ToolError::InvalidArgument {
                 argument: "database".into(),
                 expected: format!("a name not already in use; `{}` already exists", name),
@@ -211,72 +257,77 @@ impl SqliteState {
         if self.databases.len() >= self.settings.max_databases {
             return Err(ToolError::Rejected {
                 error: format!(
-                    "{} databases are already open, which is as many as you may have. drop one first",
+                    "{} databases are saved, which is as many as you may have. drop one you \
+                     no longer need first",
                     self.databases.len()
                 ),
             });
         }
 
-        // every in memory database gets an io of its own, and turso keeps
-        // them out of its process wide registry, so no two of them — not two
-        // of this agent's, not two agents' — ever share pages
-        let database = Database::open(
-            Arc::new(MemoryIO::new()),
-            ":memory:",
-            OpenOptions::new(Arc::new(SqliteDialect)),
-        )
-        .map_err(failed)?;
-        let connection = database.connect().map_err(failed)?;
-        self.databases.insert(
-            name.to_string(),
-            OpenDatabase {
-                _database: database,
-                connection,
-            },
-        );
+        fs::create_dir_all(&self.dir).map_err(failed)?;
+        let database = self.open_file(&path, OpenFlags::Create)?;
+        self.databases.insert(name.to_string(), Some(database));
         Ok(format!("created `{}`", name))
     }
 
     fn drop_database(&mut self, arguments: &serde_json::Value) -> Result<String, ToolError> {
         let name = database_name(arguments)?;
+        // removed first so the file is closed before it is deleted
         if self.databases.remove(name).is_none() {
             return Err(self.not_open(name));
+        }
+        let path = self.path(name);
+        for suffix in ["", "-wal", "-log"] {
+            let mut file = path.clone().into_os_string();
+            file.push(suffix);
+            match fs::remove_file(&file) {
+                Ok(()) => {}
+                Err(err) if err.kind() == ErrorKind::NotFound => {}
+                Err(err) => return Err(failed(err)),
+            }
         }
         Ok(format!("dropped `{}`", name))
     }
 
-    fn list(&self) -> Result<String, ToolError> {
+    fn list(&mut self) -> Result<String, ToolError> {
         if self.databases.is_empty() {
             return Ok("(no databases)".into());
         }
-        let mut lines = Vec::with_capacity(self.databases.len());
-        for (name, database) in &self.databases {
-            let tables = count_tables(&database.connection).map_err(failed)?;
-            lines.push(format!("{} ({} {})", name, tables, plural(tables, "table")));
+        let names: Vec<String> = self.databases.keys().cloned().collect();
+        let mut lines = Vec::with_capacity(names.len());
+        for name in names {
+            let line = match self.open(&name) {
+                Ok(connection) => {
+                    let tables = count_tables(&connection).map_err(failed)?;
+                    format!("{} ({} {})", name, tables, plural(tables, "table"))
+                }
+                // one that cannot be opened is still saved, and still counts
+                Err(err) => format!("{} (could not be opened: {})", name, err),
+            };
+            lines.push(line);
         }
         Ok(lines.join("\n"))
     }
 
-    fn schema(&self, arguments: &serde_json::Value) -> Result<String, ToolError> {
+    fn schema(&mut self, arguments: &serde_json::Value) -> Result<String, ToolError> {
         let name = database_name(arguments)?;
         let database = self.open(name)?;
         self.query_in_transaction(
-            database,
+            &database,
             "SELECT type, name, sql FROM sqlite_schema \
              WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
             Vec::new(),
         )
     }
 
-    fn execute(&self, arguments: &serde_json::Value) -> Result<String, ToolError> {
+    fn execute(&mut self, arguments: &serde_json::Value) -> Result<String, ToolError> {
         let name = database_name(arguments)?;
         let sql = required_string(arguments, "sql")?;
         let params = params(arguments)?;
         // anything bound has to be bound to one statement; a script would bind
         // it to the first and leave the model guessing about the rest
         check_sql(sql, params.is_some())?;
-        let database = self.open(name)?;
-        let connection = &database.connection;
+        let connection = &self.open(name)?;
         let deadline = Deadline::after(self.settings.timeout());
 
         match params {
@@ -301,13 +352,13 @@ impl SqliteState {
         }
     }
 
-    fn query(&self, arguments: &serde_json::Value) -> Result<String, ToolError> {
+    fn query(&mut self, arguments: &serde_json::Value) -> Result<String, ToolError> {
         let name = database_name(arguments)?;
         let sql = required_string(arguments, "sql")?;
         let params = params(arguments)?.unwrap_or_default();
         check_sql(sql, true)?;
         let database = self.open(name)?;
-        self.query_in_transaction(database, sql, params)
+        self.query_in_transaction(&database, sql, params)
     }
 
     /// Runs one statement in a transaction and renders a header, its rows and a
@@ -315,12 +366,11 @@ impl SqliteState {
     /// first, and the footer says so.
     fn query_in_transaction(
         &self,
-        database: &OpenDatabase,
+        connection: &Arc<Connection>,
         sql: &str,
         params: Vec<Value>,
     ) -> Result<String, ToolError> {
         let max_rows = self.settings.max_rows;
-        let connection = &database.connection;
         let deadline = Deadline::after(self.settings.timeout());
 
         self.in_transaction(connection, || {
@@ -434,19 +484,49 @@ impl SqliteState {
         }
     }
 
-    /// The database called `name`, or an error naming the ones that do exist.
-    fn open(&self, name: &str) -> Result<&OpenDatabase, ToolError> {
-        self.databases.get(name).ok_or_else(|| self.not_open(name))
+    /// A connection to the database called `name`, opening it if this is the
+    /// first call to need it, or an error naming the ones that do exist.
+    fn open(&mut self, name: &str) -> Result<Arc<Connection>, ToolError> {
+        let path = self.path(name);
+        let opened = match self.databases.get(name) {
+            None => return Err(self.not_open(name)),
+            Some(Some(database)) => return Ok(Arc::clone(&database.connection)),
+            Some(None) => self.open_file(&path, OpenFlags::None)?,
+        };
+        let connection = Arc::clone(&opened.connection);
+        self.databases.insert(name.to_string(), Some(opened));
+        Ok(connection)
     }
 
-    /// Says that `name` is not open and names the databases that are, so the
+    fn open_file(&self, path: &Path, flags: OpenFlags) -> Result<OpenDatabase, ToolError> {
+        let path_text = path.to_str().ok_or_else(|| ToolError::Failed {
+            error: format!("{} is not valid utf-8", path.display()),
+        })?;
+        let database = Database::open(
+            self.io.clone(),
+            path_text,
+            OpenOptions::new(Arc::new(SqliteDialect)).flags(flags),
+        )
+        .map_err(open_failed)?;
+        let connection = database.connect().map_err(open_failed)?;
+        Ok(OpenDatabase {
+            _database: database,
+            connection,
+        })
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        self.dir.join(format!("{}.db", name))
+    }
+
+    /// Says that `name` is not a database and names the ones that are, so the
     /// model can pick one rather than guess again.
     fn not_open(&self, name: &str) -> ToolError {
         let open = if self.databases.is_empty() {
             "there are none; create one first".to_string()
         } else {
             format!(
-                "the open databases are: {}",
+                "the databases are: {}",
                 self.databases
                     .keys()
                     .cloned()
@@ -456,7 +536,7 @@ impl SqliteState {
         };
         ToolError::InvalidArgument {
             argument: "database".into(),
-            expected: format!("an open database; `{}` is not one, and {}", name, open),
+            expected: format!("an existing database; `{}` is not one, and {}", name, open),
         }
     }
 }
@@ -543,13 +623,16 @@ fn bind(statement: &mut Statement, params: Vec<Value>) -> Result<(), SqlError> {
 }
 
 /// Steps `statement` to its next row: true if there is one, false once done.
-/// Storage work turso asks for is immediate in memory, so it is done inline.
+/// File io is driven inline, and a wait turso asks for is slept rather than
+/// spun.
 fn step(statement: &mut Statement) -> Result<bool, SqlError> {
     loop {
         match statement.step()? {
             StepResult::Row => return Ok(true),
             StepResult::Done => return Ok(false),
-            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
+            StepResult::IO | StepResult::Yield => statement._io().step()?,
+            StepResult::Sleep { duration } => {
+                thread::sleep(duration);
                 statement._io().step()?
             }
             StepResult::Interrupt => return Err(SqlError::TimedOut),
@@ -632,8 +715,8 @@ fn count_tables(connection: &Arc<Connection>) -> Result<i64, LimboError> {
 //////////////////////////////////////
 
 /// Refuses sql the tool will not run, before any of it is: `VACUUM INTO`,
-/// which writes the database out to a file, and — when `single` — more than
-/// one statement.
+/// `ATTACH` and `DETACH`, which reach files other than the database, and —
+/// when `single` — more than one statement.
 fn check_sql(sql: &str, single: bool) -> Result<(), ToolError> {
     // whitespace is collapsed first so a newline between the two words does
     // not get past the check
@@ -645,8 +728,16 @@ fn check_sql(sql: &str, single: bool) -> Result<(), ToolError> {
     if normalised.contains("VACUUM INTO") {
         return Err(ToolError::InvalidArgument {
             argument: "sql".into(),
-            expected: "free of `VACUUM INTO`; databases stay in memory and cannot be \
-                       written to a file"
+            expected: "free of `VACUUM INTO`; a database cannot be written out to \
+                       another file"
+                .into(),
+        });
+    }
+    if attaches(sql) {
+        return Err(ToolError::InvalidArgument {
+            argument: "sql".into(),
+            expected: "free of `ATTACH` and `DETACH`; each call works on the one \
+                       database it names"
                 .into(),
         });
     }
@@ -676,16 +767,37 @@ fn count_statements(sql: &str) -> usize {
     count
 }
 
+/// Whether any statement in `sql` is an `ATTACH` or `DETACH`. Sql that does
+/// not parse stops the search; turso refuses it when it is run.
+fn attaches(sql: &str) -> bool {
+    for statement in turso_parser::parser::Parser::new(sql.as_bytes()) {
+        match statement {
+            Ok(Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan { stmt, .. }) => {
+                if matches!(stmt, Stmt::Attach { .. } | Stmt::Detach { .. }) {
+                    return true;
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
+/// A name that is safe to use as a file name: letters, digits, `_` or `-`
+/// only, so it can never be read as a path.
+pub(crate) fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_NAME_LENGTH
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
 /// The `database` argument, checked to be a name rather than anything that
 /// could be read as a path.
 fn database_name(arguments: &serde_json::Value) -> Result<&str, ToolError> {
     let name = required_string(arguments, "database")?;
-    let valid = !name.is_empty()
-        && name.len() <= MAX_NAME_LENGTH
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
-    if !valid {
+    if !valid_name(name) {
         return Err(ToolError::InvalidArgument {
             argument: "database".into(),
             expected: format!("1 to {} letters, digits, `_` or `-`", MAX_NAME_LENGTH),
@@ -763,7 +875,7 @@ fn truncate(content: String) -> String {
 
 /// Cuts `content` to at most `limit` bytes, on a character boundary, and says
 /// how much was left out.
-fn cut(mut content: String, limit: usize) -> String {
+pub(crate) fn cut(mut content: String, limit: usize) -> String {
     if content.len() <= limit {
         return content;
     }
@@ -790,5 +902,16 @@ fn plural(count: i64, noun: &str) -> String {
 fn failed(err: impl std::fmt::Display) -> ToolError {
     ToolError::Failed {
         error: err.to_string(),
+    }
+}
+
+/// A database that would not open. Another apila process holding the file is
+/// worth saying in words, since nothing about the call is wrong.
+fn open_failed(err: LimboError) -> ToolError {
+    match err {
+        LimboError::LockingError(_) => ToolError::Failed {
+            error: "the database is in use by another apila process".into(),
+        },
+        err => failed(err),
     }
 }

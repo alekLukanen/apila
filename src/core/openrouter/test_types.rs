@@ -1,8 +1,9 @@
 use serde_json::json;
 
 use super::types::{
-    ApiErrorBody, ChatCompletionRequest, ChatCompletionResponse, FinishReason, FunctionCall,
-    Message, Reasoning, ReasoningEffort, Tool, ToolCall, ToolChoice,
+    ApiErrorBody, ChatCompletionRequest, ChatCompletionResponse, EmbeddingRequest,
+    EmbeddingResponse, FinishReason, FunctionCall, Message, Reasoning, ReasoningEffort, Tool,
+    ToolCall, ToolChoice,
 };
 
 #[test]
@@ -293,4 +294,43 @@ fn validate_rejects_a_request_with_no_user_message() {
         .expect_err("a system message is not a conversation");
 
     assert!(err.contains("user message"));
+}
+
+#[test]
+fn an_embedding_request_serializes_its_model_and_inputs() {
+    let request = EmbeddingRequest::new("openai/text-embedding-3-small", vec!["a".into()]);
+
+    assert_eq!(
+        serde_json::to_value(&request).expect("serialize"),
+        json!({"model": "openai/text-embedding-3-small", "input": ["a"]})
+    );
+}
+
+#[test]
+fn an_embedding_request_needs_a_model_and_text() {
+    assert!(EmbeddingRequest::new("m/e", vec!["a".into()])
+        .validate()
+        .is_ok());
+    assert!(EmbeddingRequest::new(" ", vec!["a".into()])
+        .validate()
+        .is_err());
+    assert!(EmbeddingRequest::new("m/e", Vec::new()).validate().is_err());
+    assert!(EmbeddingRequest::new("m/e", vec!["  ".into()])
+        .validate()
+        .is_err());
+}
+
+#[test]
+fn an_embedding_response_deserializes_with_extra_fields() {
+    let response: EmbeddingResponse = serde_json::from_value(json!({
+        "object": "list",
+        "model": "openai/text-embedding-3-small",
+        "data": [{"object": "embedding", "index": 0, "embedding": [0.25, -0.5]}],
+        "usage": {"prompt_tokens": 3, "total_tokens": 3},
+    }))
+    .expect("deserialize");
+
+    assert_eq!(response.data.len(), 1);
+    assert_eq!(response.data[0].embedding, vec![0.25, -0.5]);
+    assert_eq!(response.usage.expect("usage").prompt_tokens, 3);
 }

@@ -2,9 +2,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use crate::core::openrouter::types::{
-    ChatCompletionRequest, FunctionCall, Message, ToolCall,
-};
+use crate::core::openrouter::types::{ChatCompletionRequest, FunctionCall, Message, ToolCall};
 use crate::core::runtime::agent_config::{ToolConfig, ToolSettings};
 use crate::core::tools::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolState};
 
@@ -323,10 +321,7 @@ fn settings(enabled: &[&str], configs: Vec<ToolConfig>) -> ToolSettings {
 fn tool_config(tool: &str, settings: serde_json::Value) -> ToolConfig {
     ToolConfig {
         tool: tool.into(),
-        settings: settings
-            .as_object()
-            .expect("an object")
-            .clone(),
+        settings: settings.as_object().expect("an object").clone(),
     }
 }
 
@@ -370,6 +365,19 @@ fn only_the_tools_an_agent_can_ask_for_are_offered_as_names() {
         registry().enableable_names(),
         vec!["echo".to_string(), "refusing".to_string()]
     );
+}
+
+/// The skill tools come with `memory.skills`, so naming them in `enabled` is
+/// not something to suggest.
+#[test]
+fn the_skill_tools_are_not_offered_as_names() {
+    let registry = ToolRegistry::with_default_tools();
+
+    assert!(registry.tool("search_skills").is_some());
+    assert!(registry.tool("get_skill").is_some());
+    let names = registry.enableable_names();
+    assert!(!names.contains(&"search_skills".to_string()), "{names:?}");
+    assert!(!names.contains(&"get_skill".to_string()), "{names:?}");
 }
 
 #[test]
@@ -783,7 +791,8 @@ fn a_state_is_closed_when_it_goes_out_of_scope() {
 /// only ever work in its own.
 #[test]
 fn a_tool_is_run_in_the_directory_it_is_given() {
-    let given = std::env::temp_dir().join(format!("apila-test-registry-dir-{}", std::process::id()));
+    let given =
+        std::env::temp_dir().join(format!("apila-test-registry-dir-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&given);
     std::fs::create_dir_all(&given).expect("create the directory");
     std::fs::write(given.join("marker.txt"), "the given directory").expect("write marker");
@@ -885,10 +894,12 @@ fn every_call_in_a_batch_is_answered_even_when_one_panics() {
     ];
     let answered: Vec<String> = calls
         .iter()
-        .map(|one| match tools.dispatch(&mut states, &dir(), one).message() {
-            Message::Tool { tool_call_id, .. } => tool_call_id,
-            other => panic!("expected a tool message, got {:?}", other),
-        })
+        .map(
+            |one| match tools.dispatch(&mut states, &dir(), one).message() {
+                Message::Tool { tool_call_id, .. } => tool_call_id,
+                other => panic!("expected a tool message, got {:?}", other),
+            },
+        )
         .collect();
 
     assert_eq!(

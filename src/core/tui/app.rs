@@ -18,7 +18,7 @@ use clap::Parser;
 
 use crate::core::config::config;
 use crate::core::openrouter::types::Message;
-use crate::core::runtime::agent::{AgentDefinition, AgentState};
+use crate::core::runtime::agent::{AgentDefinition, AgentState, ClearOutcome};
 use crate::core::runtime::{agent_config, runtime};
 
 /// How long the ui waits for a key before redrawing. Agents answer on
@@ -36,6 +36,9 @@ const TOOL_OUTPUT_LINES: usize = 12;
 /// expecting it, so anything else would misalign the thing the transcript is
 /// trying to show faithfully.
 const TAB_WIDTH: usize = 8;
+
+/// Typed into the chat, ends the agent's session and starts a new one.
+const CLEAR_COMMAND: &str = "/clear";
 
 #[derive(Debug, Parser)]
 #[command(version, about, long_about = None)]
@@ -86,6 +89,8 @@ pub struct TUIApp {
     chat_focused: bool,
     /// Shown along the bottom of the detail window until the next key press.
     status_message: Option<String>,
+    /// The same, for news that is not an error.
+    info_message: Option<String>,
 
     exit: bool,
 }
@@ -122,6 +127,7 @@ impl TUIApp {
             chat_inputs: HashMap::new(),
             chat_focused: false,
             status_message: None,
+            info_message: None,
             exit: false,
         })
     }
@@ -161,6 +167,7 @@ impl TUIApp {
     /// Acts on one key press, whichever window has focus.
     pub fn handle_key(&mut self, key: KeyEvent) -> Result<(), TUIAppError> {
         self.status_message = None;
+        self.info_message = None;
 
         // always available, whatever has focus
         if let KeyEvent {
@@ -233,6 +240,10 @@ impl TUIApp {
                 if content.trim() == "" {
                     return Ok(());
                 }
+                if content.trim() == CLEAR_COMMAND {
+                    self.clear_session(&id);
+                    return Ok(());
+                }
                 match self.rt.send_agent_message(&id, content) {
                     Ok(_) => {
                         self.chat_inputs.remove(&id);
@@ -246,6 +257,20 @@ impl TUIApp {
             _ => {}
         }
         Ok(())
+    }
+
+    /// `/clear` ends the session rather than going to the model as a message.
+    fn clear_session(&mut self, id: &str) {
+        match self.rt.clear_agent_session(id) {
+            Ok(outcome) => {
+                self.chat_inputs.remove(id);
+                self.info_message = Some(match outcome {
+                    ClearOutcome::Cleared => "session cleared".into(),
+                    ClearOutcome::Queued => "clear queued — runs when this turn ends".into(),
+                });
+            }
+            Err(err) => self.status_message = Some(err.to_string()),
+        }
     }
 
     /// Move the agent table selection by `offset` rows, clamped to the
@@ -339,6 +364,7 @@ impl TUIApp {
             ],
             Focus::Chat => vec![
                 ("Send", " <Enter>"),
+                ("New Session", " /clear"),
                 ("Leave Chat", " <Esc>"),
                 ("Quit", " <Ctrl+C>"),
             ],
@@ -536,7 +562,11 @@ impl TUIApp {
             return Ok(());
         };
 
-        let status_height = if self.status_message.is_some() { 2 } else { 0 };
+        let status_height = if self.status_message.is_some() || self.info_message.is_some() {
+            2
+        } else {
+            0
+        };
         let config_lines = self.config_lines(&definition);
         let layout = Layout::vertical([
             Constraint::Length(config_lines.len() as u16 + 1),
@@ -558,6 +588,11 @@ impl TUIApp {
         if let Some(status) = &self.status_message {
             frame.render_widget(
                 Paragraph::new(Line::from(status.clone()).red()).wrap(Wrap::default()),
+                status_area,
+            );
+        } else if let Some(info) = &self.info_message {
+            frame.render_widget(
+                Paragraph::new(Line::from(info.clone()).dark_gray()).wrap(Wrap::default()),
                 status_area,
             );
         }
@@ -585,7 +620,7 @@ impl TUIApp {
             names.join(", ")
         };
 
-        vec![
+        let mut lines = vec![
             // the name is the directory the agent was loaded from, which is
             // also its id, so there is nothing else worth putting here
             Line::from(Span::from(config.name()).bold().cyan()),
@@ -609,7 +644,14 @@ impl TUIApp {
                 Span::from("State:     ").dark_gray(),
                 Span::from(state.label()).style(Style::default().fg(Self::state_color(&state))),
             ]),
-        ]
+        ];
+        if let Some(memory) = definition.memory_status() {
+            lines.push(Line::from(vec![
+                Span::from("Memory:    ").dark_gray(),
+                Span::from(memory).blue(),
+            ]));
+        }
+        lines
     }
 
     fn render_configuring(&mut self, definition: &AgentDefinition, area: Rect, frame: &mut Frame) {
@@ -703,6 +745,22 @@ impl TUIApp {
         }
         if let AgentState::Failed(err) = definition.state() {
             lines.push(Line::from(format!("error: {}", err)).red());
+        }
+        // a clear waits for the turn to end, and what is sent meanwhile opens
+        // the session after it
+        if definition.clear_pending() {
+            lines.push(Line::from(""));
+            lines.push(
+                Line::from("── clear queued — runs when this turn ends ──")
+                    .yellow()
+                    .italic(),
+            );
+            if !definition.next_session_messages().is_empty() {
+                lines.push(Line::from("next session").yellow().bold());
+                for message in definition.next_session_messages() {
+                    lines.extend(Self::message_lines(message, width, false));
+                }
+            }
         }
 
         // keep the newest output on screen
