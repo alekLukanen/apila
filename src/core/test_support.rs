@@ -1,7 +1,5 @@
-//! Helpers shared by the test modules. They stand up the real things the
-//! runtime talks to — a project directory on disk and an http server speaking
-//! openrouter's chat completion shape — so tests drive the runtime through
-//! its own interface rather than reaching inside it.
+//! Stands up a real project directory and an openrouter-shaped http server,
+//! so tests drive the runtime through its own interface.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
@@ -90,12 +88,8 @@ impl StubReply {
     }
 }
 
-/// A stand in for openrouter that answers chat completions from a script and
-/// keeps the request bodies it was sent. Point a project's
-/// `openrouter_base_url` at [`StubOpenRouter::base_url`].
-///
-/// The server thread lives for the rest of the test binary; it holds one
-/// loopback port and goes away with the process.
+/// Point a project's `openrouter_base_url` at [`StubOpenRouter::base_url`].
+/// The server thread is never stopped; it goes away with the test process.
 pub struct StubOpenRouter {
     base_url: String,
     requests: Arc<Mutex<Vec<String>>>,
@@ -115,12 +109,8 @@ impl StubOpenRouter {
         StubOpenRouter::start_script(vec![StubReply::text(reply)], delay)
     }
 
-    /// Answers each request with the next reply in `replies`.
-    ///
-    /// Once the script runs out the last reply repeats, so a one reply script
-    /// behaves exactly as the single reply server always has — and a test that
-    /// means to run an agent out of iterations only has to script one tool
-    /// call.
+    /// The last reply repeats once the script runs out, so running an agent
+    /// out of iterations takes only one scripted tool call.
     pub fn start_script(replies: Vec<StubReply>, delay: Duration) -> StubOpenRouter {
         assert!(!replies.is_empty(), "a stub server needs a reply");
 

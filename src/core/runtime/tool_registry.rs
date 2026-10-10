@@ -9,7 +9,9 @@ use crate::core::openrouter::types::{Message, ToolCall};
 use crate::core::runtime::agent_config::ToolSettings;
 use crate::core::tools::bash::BashTool;
 use crate::core::tools::end_turn::EndTurnTool;
+use crate::core::tools::sqlite::SqliteTool;
 use crate::core::tools::tool::{catching_panics, Tool, ToolContext, ToolOutput, ToolState};
+use crate::core::tools::webpage::{FetchWebpageTool, ReadWebpageDataTool};
 
 /// Why an agent's `tools` block could not be turned into a set of tools it can
 /// call. Every one of these stops the agent being configured, the same way a
@@ -29,13 +31,9 @@ pub enum ToolSettingsError {
     InvalidToolConfig { tool: String, error: String },
 }
 
-/// Every tool this runtime knows how to run, in the order it was registered —
-/// which is the order the model sees them in, so it is kept stable rather than
-/// left to a map's iteration order.
-///
-/// One registry is built by the runtime and shared by every agent behind an
-/// `Arc`. It can be shared because a registered tool holds no per agent state:
-/// what an agent accumulates lives in the [`ToolStates`] its own thread owns.
+/// Registration order is the order the model sees the tools in, so it is a
+/// `Vec` rather than a map. Shared by every agent; per agent state lives in
+/// [`ToolStates`].
 pub struct ToolRegistry {
     tools: Vec<Arc<dyn Tool>>,
 }
@@ -57,6 +55,9 @@ impl ToolRegistry {
         ToolRegistry::new()
             .register(Arc::new(EndTurnTool::new()))
             .register(Arc::new(BashTool::new()))
+            .register(Arc::new(SqliteTool::new()))
+            .register(Arc::new(FetchWebpageTool::new()))
+            .register(Arc::new(ReadWebpageDataTool::new()))
     }
 
     /// Adds a tool, replacing one already registered under the same name so a
@@ -90,12 +91,8 @@ impl ToolRegistry {
             .collect()
     }
 
-    /// Works out which tools an agent gets, and checks each one's settings.
-    ///
-    /// Called once, when the agent's files are read: an unknown name or a bad
-    /// setting shows up on the configuration screen rather than mid turn, and
-    /// the agent loop is handed the answer rather than working it out again on
-    /// every request.
+    /// Called when the agent's files are read, so an unknown name or bad
+    /// setting shows on the configuration screen rather than mid turn.
     pub fn resolve(&self, settings: &ToolSettings) -> Result<AgentTools, ToolSettingsError> {
         let mut configs: HashMap<String, serde_json::Value> = HashMap::new();
         for config in &settings.configs {
@@ -168,11 +165,8 @@ impl ToolRegistry {
     }
 }
 
-/// The tools one agent may call, already looked up and already paired with that
-/// agent's settings for each. Worked out once when the agent's files are read
-/// and held from then on, so nothing on the hot path re-reads a `config.json`
-/// or searches the registry. Cheap to clone: an `Arc` and a small json value
-/// per tool.
+/// Each tool paired with this agent's settings for it, resolved once so no
+/// request re-reads a `config.json` or searches the registry.
 #[derive(Clone)]
 pub struct AgentTools {
     tools: Vec<(Arc<dyn Tool>, serde_json::Value)>,
@@ -213,15 +207,9 @@ impl AgentTools {
             .collect()
     }
 
-    /// Runs one call the model asked for, in `dir`, against the state this
-    /// agent keeps for the tool — starting that state if this is the first time
-    /// the agent has reached for it.
-    ///
-    /// Every way this can go wrong — a tool that isn't enabled, arguments that
-    /// aren't json, a tool that refuses the call — comes back as a tool message
-    /// rather than as an error, because the model is the one that can fix any
-    /// of them and it can only read what it is sent. A bad call costs an
-    /// iteration, not the turn.
+    /// Every failure comes back as a tool message rather than an error, since
+    /// the model is the one that can fix it. A bad call costs an iteration, not
+    /// the turn.
     pub fn dispatch(&self, states: &mut ToolStates, dir: &Path, call: &ToolCall) -> ToolResult {
         let Some((tool, config)) = self
             .tools
@@ -253,12 +241,8 @@ impl AgentTools {
     }
 }
 
-/// Reads the arguments the model sent, which arrive as a json document encoded
-/// in a string rather than as json.
-///
-/// A call that takes no arguments regularly arrives as `""` or as `null`, and
-/// neither is an error worth making the model recover from, so both read as an
-/// empty object.
+/// Calls with no arguments often arrive as `""` or `null`; both read as an
+/// empty object rather than an error.
 fn parse_arguments(raw: &str) -> Result<serde_json::Value, String> {
     if raw.trim() == "" {
         return Ok(serde_json::json!({}));
@@ -272,22 +256,9 @@ fn parse_arguments(raw: &str) -> Result<serde_json::Value, String> {
     }
 }
 
-/// What each tool holds for one agent.
-///
-/// Kept apart from [`AgentTools`] on purpose: `AgentTools` is immutable and
-/// cloned freely, while this is a single mutable thing owned by the agent's own
-/// thread and never shared — so a state needs no lock, and closes whatever it
-/// opened when that thread ends.
-///
-/// A state is created the first time the agent calls its tool rather than when
-/// the agent starts, so a tool that opens a connection does not open one for an
-/// agent that never gets round to using it.
-///
-/// Nothing rebuilds a state once it exists, which means whatever it read out of
-/// its config when it started is what it runs on for the rest of the agent's
-/// life. That is not a staleness problem: an agent's `config.json` is read once,
-/// when its files are loaded, and `Runtime::reload_config_files` refuses a
-/// started agent for exactly this reason.
+/// Owned by the agent's thread, unlike the freely cloned [`AgentTools`], so no
+/// state needs a lock. Each is created on the tool's first call and never
+/// rebuilt, which is why a started agent's config cannot be reloaded.
 pub struct ToolStates {
     states: HashMap<String, Box<dyn ToolState>>,
 }
@@ -305,17 +276,8 @@ impl ToolStates {
         }
     }
 
-    /// Runs one call against the state this agent keeps for `tool`, starting
-    /// that state if this is the first time the agent has reached for it.
-    ///
-    /// Returns the reason as text rather than a `ToolError`, because a panic is
-    /// one of the things that can come back and it is not one.
-    ///
-    /// A failure to start is not remembered: the next call tries again, so a
-    /// connection that was refused once does not leave the tool broken for the
-    /// rest of the agent's life. Neither is a state that panicked kept — it may
-    /// be halfway through whatever it was doing, so it is dropped and the next
-    /// call starts a fresh one.
+    /// Errors are text because a panic can be one. A state that failed to
+    /// start or panicked is not kept, so the next call starts a fresh one.
     fn run(
         &mut self,
         tool: &Arc<dyn Tool>,

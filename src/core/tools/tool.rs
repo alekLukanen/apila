@@ -6,12 +6,8 @@ use std::sync::Once;
 
 use thiserror::Error;
 
-/// Something an agent can be given to do beyond talking, and the means of
-/// starting one for a particular agent.
-///
-/// Registered once for the whole runtime and shared across every agent thread,
-/// so an implementation holds nothing that belongs to one agent — that lives in
-/// the [`ToolState`] it hands out.
+/// Shared by every agent thread, so it holds nothing that belongs to one
+/// agent; that lives in the [`ToolState`] it hands out.
 pub trait Tool: Send + Sync {
     /// How the model names the tool when it calls it, and the name the user
     /// writes in `enabled`. Limited to 64 characters of `[A-Za-z0-9_-]` by the
@@ -40,29 +36,16 @@ pub trait Tool: Send + Sync {
         Ok(())
     }
 
-    /// Starts the tool for one agent: opens whatever it needs open and parses
-    /// whatever it needs parsed, once. Called the first time that agent calls
-    /// this tool, and never again for as long as the agent lives.
-    ///
-    /// A failure here is reported to the model like any other failed call, and
-    /// is not remembered — a database that was down on one call can be up on
-    /// the next, and an agent that could never retry would be stuck.
+    /// Called on an agent's first call to this tool. A failure is reported to
+    /// the model and not remembered, so the next call tries again.
     fn new_state(&self, context: &ToolContext) -> Result<Box<dyn ToolState>, ToolError>;
 }
 
-/// What one tool holds for one agent, for as long as that agent runs.
-///
-/// It lives on the agent's own thread and is never shared, which is what makes
-/// `&mut self` here reasonable: a tool mutates its own state directly instead
-/// of locking, and whatever it opened is closed by its `Drop` when the agent's
-/// thread ends.
+/// One tool's state for one agent. It never leaves the agent's thread, so it
+/// is mutated without locking and closed by its `Drop` when the thread ends.
 pub trait ToolState: Send {
-    /// Runs one call. `arguments` is the model's parsed json, normalised to an
-    /// object by the caller, so a tool only looks up the keys it declared.
-    ///
-    /// Failing here is not the agent failing: the failure is turned into a tool
-    /// message the model can read and correct from, which is why the error says
-    /// what was wrong with the call.
+    /// `arguments` is always a json object. An error goes back to the model as
+    /// a tool message, so it should say what to change about the call.
     fn run(
         &mut self,
         context: &ToolContext,
@@ -70,10 +53,8 @@ pub trait ToolState: Send {
     ) -> Result<ToolOutput, ToolError>;
 }
 
-/// What a tool is told about the agent calling it: where to work, and the
-/// tool's own entry from the agent's `tools.configs`. The same context is given
-/// to `new_state` and to every `run` after it, so a tool can either read it each
-/// call or keep what it needs at the moment it starts.
+/// The same context is given to `new_state` and every `run` after it, so a
+/// tool can read it each call or keep what it needs when it starts.
 #[derive(Debug, Clone)]
 pub struct ToolContext {
     dir: PathBuf,
@@ -105,13 +86,8 @@ impl ToolContext {
     }
 }
 
-/// What a tool has to say back to the model, and whether it wants the agent's
-/// turn to stop here.
-///
-/// The control signal rides on the output rather than the caller watching for a
-/// tool named `end_turn`, so the agent loop never has to know which tools are
-/// registered, and a later tool that also finishes a turn needs no change to
-/// the loop.
+/// Ending the turn rides on the output rather than the loop watching for
+/// `end_turn`, so the loop never needs to know which tools exist.
 #[derive(Debug, Clone)]
 pub struct ToolOutput {
     content: String,
@@ -139,10 +115,8 @@ impl ToolOutput {
     }
 }
 
-/// Why a tool call could not be run, whether it failed to start for this agent
-/// or failed on this one call. All of these are the model's mistake or the
-/// environment's, and all of them come back to the model as a tool message
-/// rather than stopping the agent.
+/// Every variant goes back to the model as a tool message; none of them stops
+/// the agent.
 #[derive(Debug, Clone, Error)]
 pub enum ToolError {
     #[error("`{argument}` is required")]
@@ -159,10 +133,56 @@ pub enum ToolError {
     #[error("the tool's config is not usable: {error}")]
     InvalidConfig { error: String },
 
+    /// The tool understood the call and ran it, and what it asked for could not
+    /// be done — sql that does not parse, a table that does not exist. The
+    /// call is to blame, and the message says what to change.
+    #[error("the call was rejected: {error}")]
+    Rejected { error: String },
+
     /// The tool was running and something went wrong that the call is not to
     /// blame for.
     #[error("the tool failed while running: {error}")]
     Failed { error: String },
+}
+
+// Arguments /////////////////////////
+//////////////////////////////////////
+
+/// A string argument the call must send. A blank one is refused too, since no
+/// tool can do anything with it.
+pub fn required_string<'a>(
+    arguments: &'a serde_json::Value,
+    argument: &str,
+) -> Result<&'a str, ToolError> {
+    let value = optional_string(arguments, argument)?.ok_or_else(|| {
+        ToolError::MissingArgument {
+            argument: argument.into(),
+        }
+    })?;
+    if value.trim().is_empty() {
+        return Err(ToolError::InvalidArgument {
+            argument: argument.into(),
+            expected: "not empty".into(),
+        });
+    }
+    Ok(value)
+}
+
+/// A string argument the call may leave out; `null` counts as left out.
+pub fn optional_string<'a>(
+    arguments: &'a serde_json::Value,
+    argument: &str,
+) -> Result<Option<&'a str>, ToolError> {
+    match arguments.get(argument) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => value
+            .as_str()
+            .map(Some)
+            .ok_or_else(|| ToolError::InvalidArgument {
+                argument: argument.into(),
+                expected: "a string".into(),
+            }),
+    }
 }
 
 // Panics ////////////////////////////
@@ -173,25 +193,15 @@ thread_local! {
     static CATCHING_PANICS: Cell<bool> = const { Cell::new(false) };
 }
 
-/// True when this thread is running something whose panic is about to be
-/// caught and turned into a result.
-///
-/// The terminal's panic hook reads this: a panic the program is not going to
-/// die from must not tear down the alternate screen or print over it.
+/// Read by the terminal's panic hook, so a panic that will be caught does not
+/// tear down the alternate screen or print over it.
 pub fn panics_are_being_caught() -> bool {
     CATCHING_PANICS.with(|catching| catching.get())
 }
 
-/// Runs `body`, turning a panic into an `Err` carrying whatever the panic said.
-///
-/// A tool is, as far as the agent loop is concerned, someone else's code. One
-/// that panics would otherwise take the agent's thread with it, and the agent
-/// would sit in `Working` forever with a tool call in its transcript that
-/// nothing ever answered — so a panic is reported to the model the same way a
-/// refused call is.
-///
-/// A tool that unwinds may be halfway through whatever it was doing, which is
-/// why the caller drops its state rather than calling it again.
+/// Keeps a panicking tool from taking the agent's thread with it and leaving
+/// its call unanswered. The tool may be left half done, so the caller should
+/// drop its state.
 pub fn catching_panics<T>(body: impl FnOnce() -> T) -> Result<T, String> {
     quieten_caught_panics();
 
@@ -203,15 +213,9 @@ pub fn catching_panics<T>(body: impl FnOnce() -> T) -> Result<T, String> {
 
 static QUIETEN: Once = Once::new();
 
-/// Stops a panic that is about to be caught from being reported as though the
-/// program were going down.
-///
-/// Whatever hook is already in place is kept and deferred to for every other
-/// panic, so this composes with the terminal's hook whichever of the two is
-/// installed first. It is done here rather than left to the caller so that a
-/// tool panicking is quiet in its own right — a library that prints a backtrace
-/// over the thing that already handled the failure is a library that cannot be
-/// used from a full screen ui.
+/// Silences panics that are about to be caught. Other panics go to the hook
+/// already in place, so this works whether it or the terminal's hook is
+/// installed first.
 fn quieten_caught_panics() {
     QUIETEN.call_once(|| {
         let hook = panic::take_hook();

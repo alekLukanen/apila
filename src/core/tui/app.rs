@@ -424,7 +424,7 @@ impl TUIApp {
                         Span::from(config.name()).bold().cyan(),
                         Span::from(format!("  {}", state.label())).dark_gray(),
                     ]),
-                    Line::from(vec![Span::from("  "), config.model().label().into()]).cyan(),
+                    Line::from(vec![Span::from("  "), config.model_label().into()]).cyan(),
                     Self::context_usage_line(context_used, CONTEXT_LIMIT_TOKENS, detail_width),
                 ])])
                 .height(3)
@@ -591,7 +591,7 @@ impl TUIApp {
             Line::from(Span::from(config.name()).bold().cyan()),
             Line::from(vec![
                 Span::from("Model:     ").dark_gray(),
-                Span::from(config.model().label()).blue(),
+                Span::from(config.model_label()).blue(),
             ]),
             Line::from(vec![
                 Span::from("Directory: ").dark_gray(),
@@ -801,17 +801,8 @@ impl TUIApp {
         format!("{}…", kept)
     }
 
-    /// Wraps `text` to `width` columns, keeping every character it was given.
-    ///
-    /// Nothing is collapsed: indentation, the runs of spaces that line a listing
-    /// up into columns, and the blank lines between paragraphs all survive. The
-    /// transcript carries file contents and command output, and a diff or an
-    /// `ls -l` whose spacing has been tidied away is no longer the thing the
-    /// agent was looking at.
-    ///
-    /// Lines are broken after a space where there is one to break after, and cut
-    /// at the width where there is not, so every line that comes back fits — a
-    /// caller counting lines is counting what will be drawn.
+    /// No whitespace is collapsed, so command output keeps its columns. Every
+    /// returned line fits `width`, so counting lines counts what is drawn.
     pub fn wrap(text: &str, width: usize) -> Vec<String> {
         // a zero width would otherwise make no line ever fit
         let width = width.max(1);
@@ -843,14 +834,8 @@ impl TUIApp {
         out
     }
 
-    /// Where to end a line that starts at `start` and cannot reach past `limit`.
-    ///
-    /// Just after the last space, so the space stays on the line it ends and the
-    /// next line starts on something worth reading. A run of characters with
-    /// nothing to break on — a minified file, a base64 blob — is cut at the
-    /// limit instead: left whole it would be drawn clipped, and a cap on the
-    /// number of lines would let the whole of it through believing it was one
-    /// line.
+    /// Breaks just after the last space so the next line starts on text. A run
+    /// with no space is cut at `limit` rather than drawn clipped.
     fn break_at(characters: &[char], start: usize, limit: usize) -> usize {
         // a space inside the indentation is not somewhere to break: doing so
         // would hand back a line of nothing but whitespace and come straight
@@ -866,12 +851,8 @@ impl TUIApp {
             .unwrap_or(limit)
     }
 
-    /// Replaces tabs with the spaces a terminal would have drawn for them.
-    ///
-    /// A tab is not something that can be placed in a cell — it would take one
-    /// column or none — so leaving it in is what turns a tab indented file into a
-    /// ragged one. Eight is what a terminal uses, and what the file was written
-    /// against.
+    /// A tab left in a cell takes one column or none, which turns a tab
+    /// indented file ragged.
     fn expand_tabs(line: &str) -> String {
         if !line.contains('\t') {
             return line.to_string();

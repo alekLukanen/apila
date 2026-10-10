@@ -225,10 +225,8 @@ fn wait_until_gone(marker: &str) -> bool {
     false
 }
 
-/// A command can exit while something it started keeps the pipe open and keeps
-/// writing. The reader has to stop rather than read and discard for the life of
-/// the process, and dropping its end of the pipe is what finishes off the
-/// orphan — so the orphan going away is the proof that the reader stopped.
+/// The orphan only dies from a broken pipe once the reader drops its end, so
+/// the orphan going away proves the reader stopped.
 #[test]
 fn a_command_that_leaves_something_writing_does_not_read_forever() {
     let dir = temp_dir("orphan-writer");

@@ -148,13 +148,8 @@ impl Runtime {
         &self.tools
     }
 
-    /// Reads the agent's files and works its `tools` block out against what
-    /// this runtime can actually run.
-    ///
-    /// Resolving here rather than in the agent loop means a tool name the user
-    /// made up is reported the way a bad model id is — on the configuration
-    /// screen, before the agent runs — and the loop is handed the tools rather
-    /// than looking them up on every request.
+    /// Tools are resolved here, not in the agent loop, so an unknown tool is
+    /// reported on the configuration screen before the agent runs.
     fn load_config_files(&self, dir: &Path) -> Result<(ConfigFiles, AgentTools), ConfigFilesError> {
         let config_files = ConfigFiles::load(dir, &self.config.project_dir())?;
         let tools = self
@@ -167,12 +162,8 @@ impl Runtime {
     // Agent operations //////////////////
     //////////////////////////////////////
 
-    /// Loads an agent for every directory in the project directory. Called at
-    /// startup and again whenever the user reloads, so a directory added on
-    /// disk shows up in the list without the user setting anything up.
-    ///
-    /// Agents that are already running are left alone; the rest have their
-    /// configuration files re-read.
+    /// Also called on reload, so a directory added on disk shows up as an
+    /// agent. Running agents are left alone; the rest re-read their files.
     pub fn load_agents(&self) {
         let dirs = self.agent_dirs();
 
@@ -265,17 +256,9 @@ impl Runtime {
             .sort_by_key(|agent| agent.agent_definition().config().name());
     }
 
-    /// Re-reads the agent's configuration files, picking up ones the user
-    /// added since it was loaded.
-    ///
-    /// Refused once the agent has started. Its settings are read once, when its
-    /// files are loaded, and everything downstream is built from that reading:
-    /// the tools it resolved to, the model its requests name, the settings its
-    /// tools parsed when they started. Reading the file again would leave those
-    /// describing different generations of it — at best a turn offering old
-    /// tools to a new model, at worst one naming a model that had just been
-    /// emptied. An agent picks up an edited `config.json` the way it picked up
-    /// the first one: on a restart.
+    /// Refused once the agent has started: its tools and their states were
+    /// built from the first reading, and a second would leave them out of step.
+    /// A started agent picks up edits on a restart.
     pub fn reload_config_files(&self, id: &str) -> Result<ConfigFiles, RuntimeError> {
         let inner = self.inner.lock().expect("mutex error");
         let mut definition = inner.agent(id)?.definition();
@@ -301,10 +284,8 @@ impl Runtime {
         Ok(config_files)
     }
 
-    /// Starts the agent, which from here on runs on its own thread. With a
-    /// `DIRECTIVE.md` it begins working straight away; without one it waits
-    /// for the user to type the first message. Fails while any required
-    /// configuration file is still missing.
+    /// With a `DIRECTIVE.md` the agent runs on it straight away; without one it
+    /// waits for the user's first message.
     pub fn start_agent(&self, id: &str) -> Result<(), RuntimeError> {
         let inner = self.inner.lock().expect("mutex error");
         inner.agent(id)?.start()?;

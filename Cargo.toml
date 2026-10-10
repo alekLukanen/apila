@@ -31,3 +31,12 @@ reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
 ] }
 
+# the engine under the `turso` crate, used directly because only it can stop a
+# statement that runs too long
+turso_core = "0.8.1"
+# already a dependency of turso_core; used to count the statements in a call
+turso_parser = "0.8.1"
+# parses saved web pages so `read_webpage_data` can filter them by css selector
+scraper = "0.27.0"
+# the `search` argument of `read_webpage_data`
+regex = "1.13.1"

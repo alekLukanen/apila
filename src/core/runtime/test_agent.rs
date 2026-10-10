@@ -13,10 +13,8 @@ use crate::core::test_support::{
 
 use super::agent::{Agent, AgentDefinition, AgentState};
 
-/// An agent the way the runtime makes one: named after its directory, with
-/// nothing read off disk yet. Its thread is spawned along with it and has
-/// nothing to do until the agent is started, so nothing here reaches the
-/// client it was handed.
+/// Built the way the runtime builds one, with nothing read off disk. It is
+/// never started, so the client it is handed is never reached.
 fn agent(name: &str) -> Agent {
     let config = AgentConfig::empty()
         .set_name(name.to_string())

@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
-use crate::core::tools::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolState};
+use crate::core::tools::tool::{
+    required_string, Tool, ToolContext, ToolError, ToolOutput, ToolState,
+};
 
 /// How long a command may run before it is killed, when the agent's config
 /// does not say.
@@ -28,10 +30,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// the case where something the command left running still holds the pipe open.
 const DRAIN_GRACE: Duration = Duration::from_millis(200);
 
-/// Runs a shell command in the agent's own directory. This is what makes the
-/// harness a coding harness, and also the one tool that can do real damage:
-/// nothing here sandboxes anything, so what an agent may do is whatever the
-/// user running apila may do. It is off unless a `config.json` enables it.
+/// Nothing is sandboxed: an agent may do whatever the user running apila may
+/// do. Off unless a `config.json` enables it.
 pub struct BashTool;
 
 impl BashTool {
@@ -119,32 +119,13 @@ impl ToolState for BashState {
         context: &ToolContext,
         arguments: &serde_json::Value,
     ) -> Result<ToolOutput, ToolError> {
-        let command = match arguments.get("command") {
-            None => {
-                return Err(ToolError::MissingArgument {
-                    argument: "command".into(),
-                })
-            }
-            Some(value) => value.as_str().ok_or_else(|| ToolError::InvalidArgument {
-                argument: "command".into(),
-                expected: "a string".into(),
-            })?,
-        };
-        if command.trim() == "" {
-            return Err(ToolError::InvalidArgument {
-                argument: "command".into(),
-                expected: "not empty".into(),
-            });
-        }
-
+        let command = required_string(arguments, "command")?;
         run_command(&context.dir(), command, self.settings.timeout())
     }
 }
 
-/// One stream of a command's output. Everything the command writes is read, so
-/// it never blocks on a full pipe, but only the first [`MAX_STREAM_BYTES`] are
-/// kept — `total` remembers how much there was so the model can be told what it
-/// is not seeing.
+/// Everything is read so the command never blocks on a full pipe, but only
+/// the start is kept; `total` lets the model be told what it is not seeing.
 struct Stream {
     kept: Vec<u8>,
     total: usize,
@@ -166,13 +147,8 @@ impl Stream {
         }
     }
 
-    /// How the stream reads in the tool's output.
-    ///
-    /// `complete` says whether the reader reached the end of the pipe. When it
-    /// did not, this is everything that had arrived rather than everything there
-    /// was, and it says so: a byte count that looks exact but was measured while
-    /// the command was still writing would have the model reasoning about output
-    /// it never saw all of.
+    /// `complete` is false when the reader never reached the end of the pipe;
+    /// the output then says the byte count is only what had arrived.
     fn render(&self, complete: bool) -> String {
         if self.total == 0 {
             return if complete {
@@ -197,19 +173,9 @@ impl Stream {
     }
 }
 
-/// Reads `reader` to its end on a thread of its own, into a buffer the caller
-/// can look at whenever it likes, until it runs out or `stop` is set.
-///
-/// A reader is what keeps the command from blocking: a pipe nobody drains fills
-/// after about 64KB and stops the command dead, which a `try_wait` loop would
-/// then sit through until the timeout.
-///
-/// `stop` is the other half of that. A command can exit while something it
-/// started keeps the pipe open and keeps writing — `bash -c 'yes &'` returns at
-/// once and then writes forever — and a reader with nowhere to put the bytes
-/// would spin at full speed for the life of the process. Once the caller has
-/// stopped listening the reader stops reading, drops its end of the pipe, and
-/// whatever is still writing gets a broken pipe and goes away.
+/// Drains the pipe so a full one never stalls the command. `stop` drops our
+/// end, so a background process still writing after the command exits gets a
+/// broken pipe instead of keeping this thread spinning.
 fn drain(
     mut reader: impl Read + Send + 'static,
     stop: Arc<AtomicBool>,
@@ -239,21 +205,14 @@ fn drain(
 /// How a command ended.
 enum Outcome {
     Exited(ExitStatus),
-    /// It outran its timeout and was killed. `group_killed` says whether
-    /// everything it started went with it, because that is the difference
-    /// between telling the model the work stopped and telling it the work may
-    /// still be going.
+    /// `group_killed` is false when what the command started may still be
+    /// running, and the model is told so.
     TimedOut { group_killed: bool },
 }
 
-/// Kills the command and everything it started.
-///
-/// The command runs in a process group of its own, so a negative pid reaches
-/// the whole group — `child.kill()` on its own signals only the shell, which
-/// leaves anything it forked running and still writing to the agent's
-/// directory. Signalling a group needs libc, which this crate does not depend
-/// on, so it goes through `kill`; when that is not there the shell is killed on
-/// its own and the model is told as much.
+/// `child.kill()` alone would leave anything the shell forked running, so the
+/// whole process group is signalled through the `kill` command. Falls back to
+/// killing only the shell, and returns false, when that fails.
 fn kill_group(child: &mut Child) -> bool {
     // the child was spawned into its own group, so its pid is the group's id
     let group = format!("-{}", child.id());
@@ -273,11 +232,8 @@ fn kill_group(child: &mut Child) -> bool {
     group_killed
 }
 
-/// Runs `command` in `dir`, killing it once `timeout` has passed.
-///
-/// A command that fails, and one that has to be killed, both come back as
-/// output rather than as an error: the exit code and whatever it printed before
-/// it was stopped are what the model needs in order to try something else.
+/// A failed or killed command is output, not an error: its exit code and what
+/// it printed are what the model needs to try something else.
 fn run_command(
     dir: &std::path::Path,
     command: &str,
@@ -335,12 +291,9 @@ fn run_command(
         thread::sleep(POLL_INTERVAL);
     };
 
-    // the readers are given a moment to finish what is already in the pipe, and
-    // are then told to stop. they are not joined: a command like `sleep 100 &`
-    // exits at once but leaves a grandchild holding the pipe, and a reader can
-    // be waiting on an end that never comes. telling it to stop is what makes
-    // that wait cost nothing — it wakes on the next byte, or never, and either
-    // way it is not spinning and not holding the pipe open for long
+    // the readers are not joined: a background process can hold the pipe open
+    // forever. they get a moment to finish what is in the pipe, then are told
+    // to stop
     let grace = Instant::now() + DRAIN_GRACE;
     while Instant::now() < grace {
         if stdout_done.load(Ordering::SeqCst) && stderr_done.load(Ordering::SeqCst) {
