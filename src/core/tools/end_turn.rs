@@ -1,9 +1,7 @@
 use crate::core::tools::tool::{Tool, ToolContext, ToolError, ToolOutput, ToolState};
 
-/// The tool an agent calls to say it is done. Ending the turn is a decision the
-/// model makes, and nothing in the text can be read as making it, so it is
-/// spelled out as a call. Available to every agent: it is how a turn ends, not
-/// something the user grants.
+/// Ending the turn is a call because nothing in the model's text can be read
+/// as deciding it. Every agent has it; it is not something the user grants.
 pub struct EndTurnTool;
 
 impl EndTurnTool {

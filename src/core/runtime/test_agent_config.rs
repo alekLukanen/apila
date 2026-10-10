@@ -1,12 +1,14 @@
 use std::{env, fs, path::PathBuf};
 
+use crate::core::openrouter::types::ReasoningEffort;
 use crate::core::test_support::{
     write_agent_config, write_agent_config_json, write_agent_config_with_tools,
     TEST_MAX_ITERATIONS,
 };
 
 use super::agent_config::{
-    ConfigFiles, ConfigFilesError, AGENTS_FILE_NAME, AGENT_CONFIG_FILE_NAME, SYSTEM_FILE_NAME,
+    AgentConfig, ConfigFiles, ConfigFilesError, Model, AGENTS_FILE_NAME, AGENT_CONFIG_FILE_NAME,
+    SYSTEM_FILE_NAME,
 };
 
 /// Creates a unique temp directory for a single test to work in.
@@ -277,4 +279,96 @@ fn a_misspelled_key_in_the_tools_block_is_reported() {
     let err = ConfigFiles::load(&agent_dir, &project_dir).expect_err("misspelled key");
 
     assert!(matches!(err, ConfigFilesError::Unreadable { .. }));
+}
+
+#[test]
+fn the_reasoning_effort_is_read_out_of_the_agent_config_file() {
+    let (project_dir, agent_dir) = agent_dir_without_config("reasoning-effort");
+    write_agent_config_json(
+        &agent_dir,
+        r#"{"model": "openai/gpt-4o", "agent_max_iterations": 5, "reasoning": {"effort": "low"}}"#,
+    );
+
+    let config_files = ConfigFiles::load(&agent_dir, &project_dir).expect("load config files");
+
+    assert_eq!(config_files.reasoning_effort(), Some(ReasoningEffort::Low));
+}
+
+#[test]
+fn an_agent_config_file_without_a_reasoning_block_sets_no_effort() {
+    let (project_dir, agent_dir) = agent_dir_without_config("no-reasoning");
+    write_agent_config(&agent_dir, "openai/gpt-4o");
+
+    let config_files = ConfigFiles::load(&agent_dir, &project_dir).expect("load config files");
+
+    assert_eq!(config_files.reasoning_effort(), None);
+}
+
+#[test]
+fn an_empty_reasoning_block_sets_no_effort() {
+    let (project_dir, agent_dir) = agent_dir_without_config("empty-reasoning");
+    write_agent_config_json(
+        &agent_dir,
+        r#"{"model": "openai/gpt-4o", "agent_max_iterations": 5, "reasoning": {}}"#,
+    );
+
+    let config_files = ConfigFiles::load(&agent_dir, &project_dir).expect("load config files");
+
+    assert_eq!(config_files.reasoning_effort(), None);
+}
+
+#[test]
+fn an_unknown_reasoning_effort_is_reported() {
+    let (project_dir, agent_dir) = agent_dir_without_config("unknown-effort");
+    write_agent_config_json(
+        &agent_dir,
+        r#"{"model": "openai/gpt-4o", "agent_max_iterations": 5, "reasoning": {"effort": "extreme"}}"#,
+    );
+
+    let err = ConfigFiles::load(&agent_dir, &project_dir).expect_err("unknown effort");
+
+    match err {
+        ConfigFilesError::Unreadable { name, error, .. } => {
+            assert_eq!(name, AGENT_CONFIG_FILE_NAME);
+            assert!(error.contains("extreme"), "{}", error);
+        }
+        other => panic!("expected Unreadable, got {:?}", other),
+    }
+}
+
+#[test]
+fn a_misspelled_key_in_the_reasoning_block_is_reported() {
+    let (project_dir, agent_dir) = agent_dir_without_config("reasoning-typo");
+    write_agent_config_json(
+        &agent_dir,
+        r#"{"model": "openai/gpt-4o", "agent_max_iterations": 5, "reasoning": {"effrot": "high"}}"#,
+    );
+
+    let err = ConfigFiles::load(&agent_dir, &project_dir).expect_err("misspelled key");
+
+    assert!(matches!(err, ConfigFilesError::Unreadable { .. }));
+}
+
+#[test]
+fn the_model_label_shows_the_reasoning_effort() {
+    let config = AgentConfig::empty()
+        .set_model(Model::parse("openai/gpt-4o").expect("parse model"))
+        .set_reasoning_effort(Some(ReasoningEffort::High));
+
+    assert_eq!(config.model_label(), "openai/gpt-4o (high)");
+}
+
+#[test]
+fn the_model_label_without_an_effort_is_the_model() {
+    let config =
+        AgentConfig::empty().set_model(Model::parse("openai/gpt-4o").expect("parse model"));
+
+    assert_eq!(config.model_label(), "openai/gpt-4o");
+}
+
+#[test]
+fn the_model_label_of_an_unset_model_ignores_the_effort() {
+    let config = AgentConfig::empty().set_reasoning_effort(Some(ReasoningEffort::High));
+
+    assert_eq!(config.model_label(), "(unset)");
 }

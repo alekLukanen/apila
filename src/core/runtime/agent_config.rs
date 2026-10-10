@@ -6,6 +6,8 @@ use std::{
 use serde::Deserialize;
 use thiserror::Error;
 
+use crate::core::openrouter::types::{Reasoning, ReasoningEffort};
+
 /// The agent's own settings. Lives in the agent's directory, alongside the
 /// project's `config.json` but scoped to this one agent.
 pub const AGENT_CONFIG_FILE_NAME: &str = "config.json";
@@ -30,6 +32,7 @@ pub struct AgentConfig {
     model: Model,
     dir: PathBuf,
     max_iterations: u32,
+    reasoning_effort: Option<ReasoningEffort>,
 }
 
 impl AgentConfig {
@@ -39,6 +42,7 @@ impl AgentConfig {
             model: Model::empty(),
             dir: PathBuf::new(),
             max_iterations: DEFAULT_MAX_ITERATIONS,
+            reasoning_effort: None,
         }
     }
     pub fn name(&self) -> String {
@@ -54,6 +58,20 @@ impl AgentConfig {
     /// The most requests the agent may make to the model in a single turn.
     pub fn max_iterations(&self) -> u32 {
         self.max_iterations
+    }
+    /// Unset leaves the choice to the provider.
+    pub fn reasoning_effort(&self) -> Option<ReasoningEffort> {
+        self.reasoning_effort
+    }
+    /// The model with its effort, if any. A model that failed to load shows
+    /// as unset alone, since the effort came from the same failed file.
+    pub fn model_label(&self) -> String {
+        match self.reasoning_effort {
+            Some(effort) if self.model.valid() => {
+                format!("{} ({})", self.model.label(), effort.as_str())
+            }
+            _ => self.model.label(),
+        }
     }
     pub fn set_name(mut self, name: String) -> AgentConfig {
         self.name = name;
@@ -71,6 +89,10 @@ impl AgentConfig {
         self.max_iterations = max_iterations;
         self
     }
+    pub fn set_reasoning_effort(mut self, effort: Option<ReasoningEffort>) -> AgentConfig {
+        self.reasoning_effort = effort;
+        self
+    }
 
     /// Everything the agent's `config.json` decides, moved onto the config the
     /// runtime holds, so a setting added to the file is wired through in one
@@ -78,6 +100,7 @@ impl AgentConfig {
     pub fn set_from_config_files(self, config_files: &ConfigFiles) -> AgentConfig {
         self.set_model(config_files.model())
             .set_max_iterations(config_files.agent_max_iterations())
+            .set_reasoning_effort(config_files.reasoning_effort())
     }
 
     /// What the agent runs with when its `config.json` could not be read. The
@@ -86,6 +109,7 @@ impl AgentConfig {
     pub fn clear_settings(self) -> AgentConfig {
         self.set_model(Model::empty())
             .set_max_iterations(DEFAULT_MAX_ITERATIONS)
+            .set_reasoning_effort(None)
     }
 }
 
@@ -164,12 +188,8 @@ impl ConfigFile {
     }
 }
 
-/// The contents of an agent's `config.json`.
-///
-/// `model` and `agent_max_iterations` are required: neither has a project wide
-/// default, and an agent that loops without a bound is worse than one that
-/// refuses to start. `tools` defaults to nothing, so an agent has to ask before
-/// it can run commands.
+/// `agent_max_iterations` is required because an agent that loops without a
+/// bound is worse than one that refuses to start. `tools` defaults to none.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AgentSettings {
     /// The model the agent runs on. Ex: "openai/gpt-4o".
@@ -181,13 +201,14 @@ pub struct AgentSettings {
     pub agent_max_iterations: u32,
 
     #[serde(default)]
+    pub reasoning: Option<Reasoning>,
+
+    #[serde(default)]
     pub tools: ToolSettings,
 }
 
-/// Which tools an agent may call and how each one is set up.
-///
-/// Kept as its own block, and each tool's settings kept as its own json, so
-/// registering a new tool never means adding a field here.
+/// Each tool's settings stay raw json so registering a new tool never means
+/// adding a field here.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolSettings {
@@ -267,15 +288,9 @@ pub struct ConfigFiles {
 }
 
 impl ConfigFiles {
-    /// Reads `config.json` out of `dir`, then looks for `AGENTS.md`,
-    /// `SYSTEM.md` and the optional `DIRECTIVE.md` alongside it. The system
-    /// prompt is allowed to live in `project_dir` instead, so a single one can
-    /// be shared by every agent in the project.
-    ///
-    /// `config.json` is required: it names the model the agent runs on, and
-    /// there is no project wide default to fall back on, so a missing,
-    /// unparseable or modelless one is an error rather than a gap the user
-    /// can be shown alongside the other files.
+    /// The system prompt may live in `project_dir` so every agent can share
+    /// one. A bad or missing `config.json` is an error, not a gap shown beside
+    /// the other files, since nothing can stand in for its model.
     pub fn load(dir: &Path, project_dir: &Path) -> Result<ConfigFiles, ConfigFilesError> {
         let config_path = dir.join(AGENT_CONFIG_FILE_NAME);
         let config_file = ConfigFile {
@@ -368,6 +383,9 @@ impl ConfigFiles {
     /// The most requests the agent may make to the model in a single turn.
     pub fn agent_max_iterations(&self) -> u32 {
         self.settings.agent_max_iterations
+    }
+    pub fn reasoning_effort(&self) -> Option<ReasoningEffort> {
+        self.settings.reasoning.as_ref().and_then(|r| r.effort)
     }
     /// The agent's `tools` block, as written. Working out which tools it comes
     /// to is the runtime's job, since only it holds the registry.

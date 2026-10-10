@@ -8,8 +8,8 @@ use crate::core::runtime::agent_config::{
 };
 use crate::core::test_support::{
     agent_dir, project_dir, project_with_delayed_server, project_with_script, project_with_server,
-    wait_until, write_agent_config, write_agent_config_with_tools, write_directive, StubReply,
-    TEST_MODEL,
+    wait_until, write_agent_config, write_agent_config_json, write_agent_config_with_tools,
+    write_directive, StubReply, TEST_MODEL,
 };
 
 use super::runtime::{Runtime, RuntimeConfig, RuntimeError};
@@ -1039,11 +1039,8 @@ fn reloading_the_config_of_a_started_agent_is_refused() {
     ));
 }
 
-/// A started agent keeps the configuration it started on, so reloading the
-/// project does not even read its files. Observed through the tool settings
-/// check, which only runs when an agent's `tools` block is worked out: the
-/// outcome alone would look the same either way, since the agent is skipped when
-/// the results are applied.
+/// Observed through the tool settings check, because the outcome alone looks
+/// the same whether or not the started agent's files were read.
 #[test]
 fn reloading_does_not_read_the_files_of_a_started_agent() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1131,4 +1128,96 @@ fn reloading_does_not_read_the_files_of_a_started_agent() {
     assert_eq!(definition.state(), AgentState::Idle);
     assert!(definition.config_error().is_none());
     assert_eq!(definition.tools().names(), before);
+}
+
+// Reasoning /////////////////////////
+//////////////////////////////////////
+
+/// Runs one turn of an agent configured by `agent_config` and returns the
+/// request bodies the stub server was sent.
+fn requests_sent_with_config(
+    name: &str,
+    agent_config: serde_json::Value,
+    replies: Vec<StubReply>,
+) -> Vec<serde_json::Value> {
+    let (dir, server) = project_with_script(name, replies);
+    let builder = agent_dir(&dir, "builder", true);
+    write_agent_config_json(&builder, &agent_config.to_string());
+    let rt = runtime(&dir);
+
+    rt.start_agent("builder").expect("start the agent");
+    rt.send_agent_message("builder", "hello".into())
+        .expect("send a message");
+    wait_until_settled(&rt, "builder");
+
+    server
+        .requests()
+        .iter()
+        .map(|request| serde_json::from_str(request).expect("a json request"))
+        .collect()
+}
+
+#[test]
+fn the_reasoning_effort_goes_out_with_the_request() {
+    let requests = requests_sent_with_config(
+        "reasoning-sent",
+        serde_json::json!({
+            "model": TEST_MODEL,
+            "agent_max_iterations": 5,
+            "reasoning": {"effort": "high"},
+        }),
+        vec![StubReply::text("done")],
+    );
+
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["reasoning"]["effort"], "high");
+}
+
+#[test]
+fn the_reasoning_effort_goes_out_with_every_request_of_a_tool_loop() {
+    let requests = requests_sent_with_config(
+        "reasoning-tool-loop",
+        serde_json::json!({
+            "model": TEST_MODEL,
+            "agent_max_iterations": 5,
+            "reasoning": {"effort": "high"},
+            "tools": {"enabled": ["bash"]},
+        }),
+        vec![
+            StubReply::tool_call("call_1", "bash", serde_json::json!({"command": "true"})),
+            StubReply::text("done"),
+        ],
+    );
+
+    assert_eq!(requests.len(), 2);
+    for request in &requests {
+        assert_eq!(request["reasoning"]["effort"], "high");
+    }
+}
+
+/// `none` turns reasoning off, which leaving it unset would not.
+#[test]
+fn a_reasoning_effort_of_none_is_sent_rather_than_dropped() {
+    let requests = requests_sent_with_config(
+        "reasoning-none",
+        serde_json::json!({
+            "model": TEST_MODEL,
+            "agent_max_iterations": 5,
+            "reasoning": {"effort": "none"},
+        }),
+        vec![StubReply::text("done")],
+    );
+
+    assert_eq!(requests[0]["reasoning"]["effort"], "none");
+}
+
+#[test]
+fn an_agent_without_a_reasoning_block_sends_no_reasoning() {
+    let requests = requests_sent_with_config(
+        "reasoning-unset",
+        serde_json::json!({"model": TEST_MODEL, "agent_max_iterations": 5}),
+        vec![StubReply::text("done")],
+    );
+
+    assert!(requests[0]["reasoning"].is_null(), "{}", requests[0]);
 }

@@ -5,7 +5,8 @@ use ratatui::{backend::TestBackend, Terminal};
 
 use crate::core::openrouter::types::Message;
 use crate::core::test_support::{
-    agent_dir, project_dir, project_with_server, wait_until, write_directive,
+    agent_dir, project_dir, project_with_server, wait_until, write_agent_config_json,
+    write_directive,
 };
 
 use super::app::{Args, TUIApp};
@@ -89,6 +90,64 @@ fn agents_are_listed_without_the_user_doing_anything() {
     // has something to show
     assert!(row("builder").contains(">\u{25cf} builder"));
     assert!(!row("reviewer").contains('>'));
+}
+
+/// Draws a project whose one agent is configured by `agent_config`, returning
+/// the agent's model line in the list, the detail pane's `Model:` line, and
+/// the whole screen.
+fn model_lines(name: &str, agent_config: &str) -> (String, String, String) {
+    let dir = project_dir(name);
+    let builder = agent_dir(&dir, "builder", true);
+    write_agent_config_json(&builder, agent_config);
+
+    let mut term = Terminal::new(TestBackend::new(120, 40)).expect("terminal");
+    let mut app = app(&dir);
+    term.draw(|frame| app.draw(frame)).expect("draw list");
+
+    let screen = format!("{}", term.backend());
+    let lines: Vec<&str> = screen.lines().collect();
+    // the model sits on the line under the agent's row in the list
+    let row = lines
+        .iter()
+        .position(|line| line.contains("\u{25cf} builder"))
+        .expect("`builder` is in the list");
+    let list_line = lines
+        .get(row + 1)
+        .expect("a line under the row")
+        .to_string();
+    let detail_line = lines
+        .iter()
+        .find(|line| line.contains("Model:"))
+        .expect("the detail pane names the model")
+        .to_string();
+    (list_line, detail_line, screen)
+}
+
+#[test]
+fn the_reasoning_effort_is_shown_after_the_model() {
+    let (list_line, detail_line, _) = model_lines(
+        "effort-shown",
+        r#"{"model": "openai/gpt-4o", "agent_max_iterations": 5, "reasoning": {"effort": "high"}}"#,
+    );
+
+    assert!(list_line.contains("openai/gpt-4o (high)"), "{}", list_line);
+    assert!(
+        detail_line.contains("openai/gpt-4o (high)"),
+        "{}",
+        detail_line
+    );
+}
+
+#[test]
+fn without_a_reasoning_effort_only_the_model_is_shown() {
+    let (list_line, detail_line, screen) = model_lines(
+        "effort-unset",
+        r#"{"model": "openai/gpt-4o", "agent_max_iterations": 5}"#,
+    );
+
+    assert!(list_line.contains("openai/gpt-4o"), "{}", list_line);
+    assert!(detail_line.contains("openai/gpt-4o"), "{}", detail_line);
+    assert!(!screen.contains("openai/gpt-4o ("), "{}", screen);
 }
 
 // Wrapping //////////////////////////

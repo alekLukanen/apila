@@ -2,7 +2,7 @@ use serde_json::json;
 
 use super::types::{
     ApiErrorBody, ChatCompletionRequest, ChatCompletionResponse, FinishReason, FunctionCall,
-    Message, Tool, ToolCall, ToolChoice,
+    Message, Reasoning, ReasoningEffort, Tool, ToolCall, ToolChoice,
 };
 
 #[test]
@@ -86,6 +86,41 @@ fn request_omits_unset_optional_fields() {
             "messages": [{ "role": "user", "content": "hi" }]
         })
     );
+}
+
+#[test]
+fn a_reasoning_effort_serializes_under_reasoning() {
+    let req = ChatCompletionRequest::new("openai/gpt-4o", vec![Message::user("hi")]).set_reasoning(
+        Reasoning {
+            effort: Some(ReasoningEffort::Xhigh),
+        },
+    );
+    let got = serde_json::to_value(&req).expect("serialize request");
+
+    assert_eq!(got["reasoning"], json!({ "effort": "xhigh" }));
+}
+
+#[test]
+fn every_reasoning_effort_uses_the_openrouter_name() {
+    let efforts = [
+        (ReasoningEffort::Xhigh, "xhigh"),
+        (ReasoningEffort::High, "high"),
+        (ReasoningEffort::Medium, "medium"),
+        (ReasoningEffort::Low, "low"),
+        (ReasoningEffort::Minimal, "minimal"),
+        (ReasoningEffort::None, "none"),
+    ];
+
+    for (effort, name) in efforts {
+        assert_eq!(effort.as_str(), name);
+        assert_eq!(
+            serde_json::to_value(effort).expect("serialize"),
+            json!(name)
+        );
+        let parsed: ReasoningEffort =
+            serde_json::from_value(json!(name)).expect("deserialize effort");
+        assert_eq!(parsed, effort);
+    }
 }
 
 #[test]

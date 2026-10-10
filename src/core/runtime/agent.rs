@@ -8,7 +8,9 @@ use std::thread;
 use thiserror::Error;
 
 use crate::core::openrouter::client::OpenRouter;
-use crate::core::openrouter::types::{ChatCompletionRequest, Message, ToolChoice, Usage};
+use crate::core::openrouter::types::{
+    ChatCompletionRequest, Message, Reasoning, ReasoningEffort, ToolChoice, Usage,
+};
 use crate::core::runtime::agent_config::{self, AgentConfig, ConfigFiles, ConfigFilesError};
 use crate::core::runtime::helpers::{classify, Turn};
 use crate::core::runtime::tool_registry::{AgentTools, ToolResult, ToolStates};
@@ -52,10 +54,9 @@ enum AgentCommand {
     Shutdown,
 }
 
-/// An agent and the thread it runs on. The thread is spawned with the agent
-/// and lives as long as it does, so a conversation in flight is never tied to
-/// whoever asked for it; the ui and the runtime talk to it over a channel and
-/// read its state through the mutex.
+/// The thread lives as long as the agent, so a conversation in flight is never
+/// tied to whoever asked for it. Commands go over a channel; state is read
+/// through the mutex.
 pub struct Agent {
     id: String,
     inner: Arc<AgentInner>,
@@ -116,10 +117,8 @@ impl Agent {
         self.inner.definition.lock().expect("mutex error")
     }
 
-    /// Starts the agent. With a `DIRECTIVE.md` its thread runs straight away
-    /// on that instruction; without one it waits for the user to type the
-    /// first message. Fails while any required configuration file is still
-    /// missing.
+    /// With a `DIRECTIVE.md` the agent runs on it straight away; without one it
+    /// waits for the user's first message.
     pub fn start(&self) -> Result<(), AgentError> {
         {
             let mut definition = self.definition();
@@ -153,14 +152,9 @@ impl Agent {
         Ok(())
     }
 
-    /// Hands the agent the user's next message. While the agent is working the
-    /// message is queued instead, and the thread picks it up at the top of its
-    /// next iteration rather than interrupting the request in flight.
-    ///
-    /// With tools that can be mid turn, between one round of tool results and
-    /// the next request, which is what lets the user steer an agent that is
-    /// already working. It is never between an assistant's tool calls and their
-    /// answers, which providers reject.
+    /// While the agent works the message is queued and joins at the next
+    /// iteration, which lets the user steer mid turn without ever landing
+    /// between tool calls and their results.
     pub fn send_message(&self, content: String) {
         {
             let mut definition = self.definition();
@@ -172,10 +166,8 @@ impl Agent {
             }
         }
 
-        // told even about a message that was only queued, so that a thread that
-        // has died — a tool that panicked hard enough to take it — is noticed
-        // here rather than leaving the agent working forever. the loop drains a
-        // command it has no use for, so saying so twice costs nothing
+        // sent even for a queued message, so a dead thread is noticed here
+        // rather than leaving the agent working forever
         self.run();
     }
 
@@ -190,10 +182,8 @@ impl Agent {
     }
 }
 
-/// Dropping the agent stops its thread. The turn already in flight finishes
-/// first — the thread owns everything it is working with, so it is left to
-/// land rather than joined, which would block the ui on a request — but the
-/// thread stops there rather than working through what is still queued.
+/// The thread is not joined, which would block the ui on a request. It
+/// finishes the turn in flight and then stops, leaving the queue unworked.
 impl Drop for Agent {
     fn drop(&mut self) {
         let _ = self.commands.send(AgentCommand::Shutdown);
@@ -204,10 +194,8 @@ impl AgentInner {
     /// The agent loop. It sits on the channel until there is something to
     /// send, and goes back to waiting once the model has finished answering.
     fn run(self: Arc<Self>, commands: Receiver<AgentCommand>) {
-        // the states its tools keep live here, on the agent's own thread, for
-        // exactly as long as the thread does. nothing else can reach them,
-        // which is why a tool mutates its own state without locking, and
-        // whatever a tool opened is closed by its `Drop` when this returns
+        // nothing else can reach these, so tools mutate them without locking,
+        // and whatever a tool opened is closed when this returns
         let mut states = ToolStates::new();
 
         while let Ok(command) = commands.recv() {
@@ -223,15 +211,9 @@ impl AgentInner {
         }
     }
 
-    /// Sends the conversation and records the reply, going around again while
-    /// there is more to do — tool calls the model asked for, or a message the
-    /// user queued while the agent was working. Returns true when the agent
-    /// went away while it was working, in which case the thread is done.
-    ///
-    /// One iteration is one request to the model. A turn is bounded by the
-    /// agent's `agent_max_iterations` so an agent that keeps calling tools
-    /// without ever finishing costs a known amount rather than running until
-    /// the user notices.
+    /// Loops while there are tool calls or queued messages to answer, up to
+    /// `agent_max_iterations` requests. True when the agent went away mid turn
+    /// and the thread is done.
     fn run_turns(&self, commands: &Receiver<AgentCommand>, states: &mut ToolStates) -> bool {
         let settings = {
             let definition = self.definition.lock().expect("mutex error");
@@ -251,11 +233,9 @@ impl AgentInner {
             let request = {
                 let mut definition = self.definition.lock().expect("mutex error");
 
-                // checked before anything is taken off the queue: a turn that
-                // gives up here never sends another request, and a message
-                // moved into the conversation now would look answered on screen
-                // while never having reached the model. it stays queued, and
-                // the user's next turn picks it up
+                // checked before the queue is taken, so a message is not shown
+                // as sent when this turn will never send it; the next turn
+                // picks it up
                 if iteration >= settings.max_iterations {
                     definition.set_state(AgentState::Failed(format!(
                         "the agent did not finish within {} iterations",
@@ -264,11 +244,9 @@ impl AgentInner {
                     return false;
                 }
 
-                // anything the user typed mid turn joins the conversation here,
-                // at the top of the loop, so it is sent with the next request.
-                // it lands after a complete set of tool results and never
-                // between an assistant's tool calls and their answers, which
-                // providers reject — moving this call later would break that
+                // must stay at the top of the loop: later, a queued message
+                // could land between tool calls and their results, which
+                // providers reject
                 definition.take_queued_messages();
                 definition.set_state(AgentState::Working);
 
@@ -349,10 +327,8 @@ impl AgentInner {
         }
     }
 
-    /// Ends the turn. The queue is checked under the same lock that idles the
-    /// agent, so a message sent right now is either queued and answered on the
-    /// next turn or sent as a turn of its own. True when the agent went idle
-    /// and the loop is finished with it.
+    /// The queue is checked under the lock that idles the agent, so no message
+    /// sent now is lost. True when the agent went idle.
     fn finish_turn(&self) -> bool {
         let mut definition = self.definition.lock().expect("mutex error");
         if definition.queued_messages().is_empty() {
@@ -363,10 +339,8 @@ impl AgentInner {
     }
 }
 
-/// Whether the agent has gone away, leaving its thread nothing to run for.
-/// Reads whatever it has sent since the thread last looked, without waiting
-/// on it. A `Run` is dropped: the state it refers to is written before the
-/// command goes out, so the loop already has it in hand.
+/// Doesn't block. A `Run` is dropped, since the state it refers to was written
+/// before it was sent and the loop already has it.
 fn shutting_down(commands: &Receiver<AgentCommand>) -> bool {
     loop {
         match commands.try_recv() {
@@ -393,17 +367,13 @@ fn build_system_prompt(config_files: &ConfigFiles) -> String {
     )
 }
 
-/// Everything a run of the agent loop works from, read once before it starts.
-///
-/// An agent's `config.json` is read when its files are loaded and not again
-/// while it runs, so none of this changes underneath the loop. Reading it all in
-/// one go is what keeps that true of the request as well: a reload part way
-/// through a turn cannot leave one iteration asking a new model for the old
-/// tools, or asking for a model that has just been emptied.
+/// Read once before the loop starts, so a reload mid turn cannot leave one
+/// request mixing old and new settings.
 struct RunSettings {
     model: String,
     dir: PathBuf,
     max_iterations: u32,
+    reasoning_effort: Option<ReasoningEffort>,
     tools: AgentTools,
 }
 
@@ -413,6 +383,7 @@ fn run_settings(definition: &AgentDefinition) -> RunSettings {
         model: config.model().full_slug(),
         dir: config.dir(),
         max_iterations: config.max_iterations(),
+        reasoning_effort: config.reasoning_effort(),
         tools: definition.tools(),
     }
 }
@@ -421,10 +392,13 @@ fn run_settings(definition: &AgentDefinition) -> RunSettings {
 /// agent may call. An agent with no tools at all leaves `tools` off the request
 /// entirely — an empty `tools: []` is rejected by some providers.
 fn chat_request(definition: &AgentDefinition, settings: &RunSettings) -> ChatCompletionRequest {
-    let request = ChatCompletionRequest::new(
-        settings.model.clone(),
-        definition.request_messages(),
-    );
+    let mut request =
+        ChatCompletionRequest::new(settings.model.clone(), definition.request_messages());
+    if let Some(effort) = settings.reasoning_effort {
+        request = request.set_reasoning(Reasoning {
+            effort: Some(effort),
+        });
+    }
     if settings.tools.is_empty() {
         return request;
     }
@@ -442,10 +416,7 @@ pub struct AgentDefinition {
     // state
     state: AgentState,
     config_files: Option<ConfigFiles>,
-    /// The tools the agent may call, worked out from its `tools` block when its
-    /// files were read. Set with `config_files` and cleared with it, since it is
-    /// the same file that decides both. Held resolved rather than as settings so
-    /// no request has to look anything up.
+    /// Set and cleared with `config_files`, since the same file decides both.
     tools: AgentTools,
     /// Why the agent's `config.json` could not be loaded, when it could not.
     /// Set instead of `config_files`, since without that file there is no

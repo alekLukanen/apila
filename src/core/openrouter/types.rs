@@ -181,6 +181,40 @@ impl FunctionCall {
 // Request ///////////////////////////
 //////////////////////////////////////
 
+/// How hard a reasoning model thinks, spelled as OpenRouter names the levels.
+/// `None` turns reasoning off, unlike leaving the effort unset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    Xhigh,
+    High,
+    Medium,
+    Low,
+    Minimal,
+    None,
+}
+
+impl ReasoningEffort {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Xhigh => "xhigh",
+            Self::High => "high",
+            Self::Medium => "medium",
+            Self::Low => "low",
+            Self::Minimal => "minimal",
+            Self::None => "none",
+        }
+    }
+}
+
+/// The `reasoning` block, shared by an agent's `config.json` and the request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Reasoning {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<ReasoningEffort>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatCompletionRequest {
     pub model: String,
@@ -196,6 +230,8 @@ pub struct ChatCompletionRequest {
     pub max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<Reasoning>,
 }
 
 impl ChatCompletionRequest {
@@ -208,6 +244,7 @@ impl ChatCompletionRequest {
             temperature: None,
             max_tokens: None,
             stop: None,
+            reasoning: None,
         }
     }
 
@@ -229,6 +266,10 @@ impl ChatCompletionRequest {
     }
     pub fn set_stop(mut self, stop: Vec<String>) -> ChatCompletionRequest {
         self.stop = Some(stop);
+        self
+    }
+    pub fn set_reasoning(mut self, reasoning: Reasoning) -> ChatCompletionRequest {
+        self.reasoning = Some(reasoning);
         self
     }
 
