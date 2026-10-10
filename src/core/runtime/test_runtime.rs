@@ -11,8 +11,8 @@ use crate::core::test_support::{
     agent_dir, point_project_at, project_dir, project_with_delayed_script,
     project_with_delayed_server, project_with_routes, project_with_script, project_with_server,
     wait_until, write_agent_config, write_agent_config_json, write_agent_config_with_skills,
-    write_agent_config_with_tools, write_directive, Route, StubOpenRouter, StubReply, TEST_MODEL,
-    TEST_WRITER_MODEL,
+    write_agent_config_with_tools, write_directive, write_skill_memory, Route, StubOpenRouter,
+    StubReply, TEST_MODEL, TEST_WRITER_MODEL,
 };
 
 use super::agent::ClearOutcome;
@@ -1563,6 +1563,38 @@ fn a_cleared_session_is_analysed_into_a_skill_when_skills_are_on() {
         rt.agent("builder").unwrap().memory_status().as_deref() == Some("saved 1 skill")
     });
     assert!(server.chat_requests(TEST_WRITER_MODEL)[0].contains("save hacker news"));
+}
+
+#[test]
+fn a_cleared_session_is_analysed_with_the_agents_skill_memory_file() {
+    let (dir, server) = project_with_skills(
+        "clear-skill-memory",
+        vec![StubReply::text("on it")],
+        writer_saves_a_skill(),
+    );
+    let builder = dir.join("builder");
+    write_skill_memory(&dir, "Save what the project says.");
+    write_skill_memory(&builder, "Only save procedures that create sqlite tables.");
+    let rt = runtime(&dir);
+    rt.start_agent("builder").expect("start");
+    rt.send_agent_message("builder", "save hacker news".into())
+        .expect("send");
+    wait_until_idle(&rt, "builder");
+
+    rt.clear_agent_session("builder").expect("clear");
+    wait_for_status(&builder, 0, SessionStatus::Analysed);
+
+    let chat = server.chat_requests(TEST_WRITER_MODEL);
+    let request: serde_json::Value = serde_json::from_str(&chat[0]).expect("json");
+    let system = request["messages"][0]["content"]
+        .as_str()
+        .expect("system prompt");
+    assert!(
+        system.contains("Only save procedures that create sqlite tables."),
+        "{system}"
+    );
+    assert!(!system.contains("Save what the project says."), "{system}");
+    assert!(!system.contains("## Pitfalls"), "{system}");
 }
 
 #[test]

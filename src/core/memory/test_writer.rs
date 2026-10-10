@@ -25,6 +25,7 @@ fn skills(max_iterations: u32) -> SkillsSettings {
         min_similarity: 0.25,
         writer_model: WRITER_MODEL.into(),
         writer_max_iterations: max_iterations,
+        instructions: None,
     }
 }
 
@@ -160,13 +161,57 @@ fn the_saved_skills_and_the_transcript_are_fenced_off_as_data() {
 
 #[test]
 fn the_prompt_states_the_limit_save_skill_enforces() {
-    let prompt = skill_writer_prompt();
+    for prompt in [
+        skill_writer_prompt(None),
+        skill_writer_prompt(Some("Save only sqlite procedures.")),
+    ] {
+        assert!(
+            prompt.contains(&format!("Save at most {} skills.", MAX_SKILLS_PER_SESSION)),
+            "{prompt}"
+        );
+        assert!(prompt.contains("<untrusted-data>"), "{prompt}");
+    }
+}
+
+#[test]
+fn the_default_prompt_describes_what_to_save_and_how_to_write_it() {
+    let prompt = skill_writer_prompt(None);
 
     assert!(
-        prompt.contains(&format!("Save at most {} skills.", MAX_SKILLS_PER_SESSION)),
+        prompt.contains("## What to save and how to write it"),
         "{prompt}"
     );
-    assert!(prompt.contains("<untrusted-data>"), "{prompt}");
+    assert!(
+        prompt.contains("Save each reusable procedure that worked in the session."),
+        "{prompt}"
+    );
+    for section in ["## Steps", "## Artifacts", "## Pitfalls"] {
+        assert!(prompt.contains(section), "{prompt}");
+    }
+    assert!(!prompt.contains("agent's owner"), "{prompt}");
+}
+
+#[test]
+fn skill_memory_instructions_replace_the_default_guidance() {
+    let instructions = "Only save sqlite procedures. Body: `## Schema` then `## Queries`.";
+    let prompt = skill_writer_prompt(Some(instructions));
+
+    assert!(
+        prompt.contains("## What to save and how to write it"),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("agent's owner wrote the instructions below"),
+        "{prompt}"
+    );
+    assert!(prompt.contains(instructions), "{prompt}");
+    assert!(!prompt.contains("## Pitfalls"), "{prompt}");
+    assert!(!prompt.contains("Save each reusable procedure"), "{prompt}");
+    // the fixed contract and rules stay, and come after the instructions
+    assert!(prompt.contains("`when_to_use`"), "{prompt}");
+    let rules = prompt.find("Rules:").expect("rules");
+    assert!(prompt.find(instructions).unwrap() < rules, "{prompt}");
+    assert!(prompt.contains("call `end_turn`"), "{prompt}");
 }
 
 // Processing ////////////////////////
@@ -282,6 +327,32 @@ fn an_agent_with_no_memory_database_is_left_alone() {
     process(&job(&dir, Some(skills(4))), &openrouter(&server), OWNER).expect("process");
 
     assert!(!memory_path(&dir).exists());
+}
+
+#[test]
+fn a_session_is_analysed_with_the_skill_memory_instructions() {
+    let (dir, _) = agent_with_pending_session();
+    let server = StubOpenRouter::start_routed(vec![(
+        Route::Chat(WRITER_MODEL.into()),
+        vec![StubReply::tool_call(
+            "call-1",
+            "end_turn",
+            serde_json::json!({}),
+        )],
+    )]);
+    let instructions = "Only save sqlite procedures.\nBody: `## Schema` then `## Queries`.";
+    let mut settings = skills(4);
+    settings.instructions = Some(instructions.into());
+    let job = job(&dir, Some(settings));
+
+    process(&job, &openrouter(&server), OWNER).expect("process");
+
+    let chat = server.chat_requests(WRITER_MODEL);
+    let request: serde_json::Value = serde_json::from_str(&chat[0]).expect("json");
+    let system = request["messages"][0]["content"]
+        .as_str()
+        .expect("system prompt");
+    assert_eq!(system, skill_writer_prompt(Some(instructions)));
 }
 
 // save_skill ////////////////////////

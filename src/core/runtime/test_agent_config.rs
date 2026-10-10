@@ -2,12 +2,14 @@ use std::{env, fs, path::PathBuf};
 
 use crate::core::openrouter::types::ReasoningEffort;
 use crate::core::test_support::{
-    write_agent_config, write_agent_config_json, write_agent_config_with_tools, TEST_MAX_ITERATIONS,
+    write_agent_config, write_agent_config_json, write_agent_config_with_skills,
+    write_agent_config_with_tools, write_skill_memory, TEST_MAX_ITERATIONS,
 };
 
 use super::agent_config::{
-    AgentConfig, ConfigFiles, ConfigFilesError, MemorySettings, Model, SkillsSettings,
-    AGENTS_FILE_NAME, AGENT_CONFIG_FILE_NAME, SYSTEM_FILE_NAME,
+    AgentConfig, ConfigFile, ConfigFiles, ConfigFilesError, MemorySettings, Model, SkillsSettings,
+    AGENTS_FILE_NAME, AGENT_CONFIG_FILE_NAME, MAX_SKILL_MEMORY_BYTES, SKILL_MEMORY_FILE_NAME,
+    SYSTEM_FILE_NAME,
 };
 
 /// Creates a unique temp directory for a single test to work in.
@@ -437,6 +439,7 @@ fn enabled_skills_fill_in_their_defaults() {
             min_similarity: 0.25,
             writer_model: "openai/gpt-4o".into(),
             writer_max_iterations: 8,
+            instructions: None,
         })
     );
     let config = AgentConfig::empty().set_from_config_files(&config_files);
@@ -586,4 +589,186 @@ fn the_skill_tools_cannot_be_named_in_the_tools_block() {
             .expect_err("named by hand");
         assert!(invalid_memory(err).contains("memory.skills"));
     }
+}
+
+/// An agent with skills enabled whose `config.json` is written but not yet
+/// loaded, so a test can place `SKILL_MEMORY.md` files first.
+fn agent_dir_with_skills(name: &str) -> (PathBuf, PathBuf) {
+    let (project_dir, agent_dir) = agent_dir_without_config(name);
+    write_agent_config_with_skills(
+        &agent_dir,
+        "openai/gpt-4o",
+        "openai/gpt-4o",
+        serde_json::json!({}),
+    );
+    (project_dir, agent_dir)
+}
+
+fn skill_instructions(config_files: &ConfigFiles) -> Option<String> {
+    config_files
+        .memory()
+        .skills
+        .expect("skills enabled")
+        .instructions
+}
+
+fn skill_memory_file(config_files: &ConfigFiles) -> Option<ConfigFile> {
+    config_files
+        .files()
+        .into_iter()
+        .find(|file| file.name() == SKILL_MEMORY_FILE_NAME)
+}
+
+#[test]
+fn skills_without_a_skill_memory_file_use_the_default_instructions() {
+    let (project_dir, agent_dir) = agent_dir_with_skills("skill-memory-absent");
+
+    let config_files = ConfigFiles::load(&agent_dir, &project_dir).expect("load");
+
+    assert_eq!(skill_instructions(&config_files), None);
+    let file = skill_memory_file(&config_files).expect("listed");
+    assert!(!file.present());
+    assert!(!file.required());
+    assert!(config_files.complete());
+}
+
+#[test]
+fn the_skill_memory_file_is_read_into_the_skills_settings() {
+    let (project_dir, agent_dir) = agent_dir_with_skills("skill-memory-local");
+    write_skill_memory(&agent_dir, "\u{feff}\n  Save only sqlite procedures.  \n\n");
+
+    let config_files = ConfigFiles::load(&agent_dir, &project_dir).expect("load");
+
+    assert_eq!(
+        skill_instructions(&config_files).as_deref(),
+        Some("Save only sqlite procedures.")
+    );
+    let file = skill_memory_file(&config_files).expect("listed");
+    assert!(file.present());
+    assert_eq!(file.path(), agent_dir.join(SKILL_MEMORY_FILE_NAME));
+    let config = AgentConfig::empty().set_from_config_files(&config_files);
+    assert_eq!(
+        config
+            .memory()
+            .skills
+            .and_then(|skills| skills.instructions),
+        Some("Save only sqlite procedures.".into())
+    );
+}
+
+#[test]
+fn the_project_skill_memory_file_is_used_when_the_agent_has_none() {
+    let (project_dir, agent_dir) = agent_dir_with_skills("skill-memory-project");
+    write_skill_memory(&project_dir, "From the project.");
+
+    let config_files = ConfigFiles::load(&agent_dir, &project_dir).expect("load");
+
+    assert_eq!(
+        skill_instructions(&config_files).as_deref(),
+        Some("From the project.")
+    );
+    let file = skill_memory_file(&config_files).expect("listed");
+    assert_eq!(file.path(), project_dir.join(SKILL_MEMORY_FILE_NAME));
+}
+
+#[test]
+fn the_agents_skill_memory_file_wins_over_the_projects() {
+    let (project_dir, agent_dir) = agent_dir_with_skills("skill-memory-both");
+    write_skill_memory(&project_dir, "From the project.");
+    write_skill_memory(&agent_dir, "From the agent.");
+
+    let config_files = ConfigFiles::load(&agent_dir, &project_dir).expect("load");
+
+    assert_eq!(
+        skill_instructions(&config_files).as_deref(),
+        Some("From the agent.")
+    );
+}
+
+#[test]
+fn an_empty_skill_memory_file_uses_the_default_instructions() {
+    let (project_dir, agent_dir) = agent_dir_with_skills("skill-memory-empty");
+    write_skill_memory(&agent_dir, " \n\t\n");
+
+    let config_files = ConfigFiles::load(&agent_dir, &project_dir).expect("load");
+
+    assert_eq!(skill_instructions(&config_files), None);
+    assert!(skill_memory_file(&config_files).expect("listed").present());
+}
+
+#[test]
+fn a_skill_memory_file_over_the_limit_is_reported() {
+    let (project_dir, agent_dir) = agent_dir_with_skills("skill-memory-large");
+    write_skill_memory(&agent_dir, &"a".repeat(MAX_SKILL_MEMORY_BYTES + 1));
+
+    let err = ConfigFiles::load(&agent_dir, &project_dir).expect_err("too large");
+
+    let message = invalid_memory(err);
+    assert!(message.contains(SKILL_MEMORY_FILE_NAME), "{message}");
+    assert!(
+        message.contains(&agent_dir.join(SKILL_MEMORY_FILE_NAME).display().to_string()),
+        "{message}"
+    );
+    assert!(message.contains("larger than"), "{message}");
+}
+
+#[test]
+fn a_skill_memory_file_at_the_limit_is_read() {
+    let (project_dir, agent_dir) = agent_dir_with_skills("skill-memory-at-limit");
+    write_skill_memory(&agent_dir, &"a".repeat(MAX_SKILL_MEMORY_BYTES));
+
+    let config_files = ConfigFiles::load(&agent_dir, &project_dir).expect("load");
+
+    assert_eq!(
+        skill_instructions(&config_files).map(|text| text.len()),
+        Some(MAX_SKILL_MEMORY_BYTES)
+    );
+}
+
+#[test]
+fn an_unreadable_skill_memory_file_is_reported() {
+    let (project_dir, agent_dir) = agent_dir_with_skills("skill-memory-unreadable");
+    fs::write(
+        agent_dir.join(SKILL_MEMORY_FILE_NAME),
+        [0xff, 0xfe, 0x00, 0x80],
+    )
+    .expect("write skill memory file");
+
+    let err = ConfigFiles::load(&agent_dir, &project_dir).expect_err("not utf-8");
+
+    let message = invalid_memory(err);
+    assert!(message.contains(SKILL_MEMORY_FILE_NAME), "{message}");
+    assert!(message.contains("could not be read"), "{message}");
+    assert!(
+        message.contains(&agent_dir.join(SKILL_MEMORY_FILE_NAME).display().to_string()),
+        "{message}"
+    );
+}
+
+#[test]
+fn without_skills_the_skill_memory_file_is_neither_read_nor_listed() {
+    let (project_dir, agent_dir) = agent_dir_without_config("skill-memory-skills-off");
+    write_agent_config(&agent_dir, "openai/gpt-4o");
+    // would be an error if it were read
+    fs::write(agent_dir.join(SKILL_MEMORY_FILE_NAME), [0xff, 0xfe])
+        .expect("write skill memory file");
+
+    let config_files = ConfigFiles::load(&agent_dir, &project_dir).expect("load");
+
+    assert_eq!(config_files.memory(), MemorySettings::default());
+    assert!(skill_memory_file(&config_files).is_none());
+}
+
+#[test]
+fn a_directory_named_skill_memory_falls_back_to_the_project_file() {
+    let (project_dir, agent_dir) = agent_dir_with_skills("skill-memory-dir");
+    fs::create_dir_all(agent_dir.join(SKILL_MEMORY_FILE_NAME)).expect("create dir");
+    write_skill_memory(&project_dir, "From the project.");
+
+    let config_files = ConfigFiles::load(&agent_dir, &project_dir).expect("load");
+
+    assert_eq!(
+        skill_instructions(&config_files).as_deref(),
+        Some("From the project.")
+    );
 }

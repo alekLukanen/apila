@@ -11,7 +11,8 @@ use std::{env, fs, thread};
 
 use crate::core::config::config::CONFIG_FILE_NAME;
 use crate::core::runtime::agent_config::{
-    AGENTS_FILE_NAME, AGENT_CONFIG_FILE_NAME, DIRECTIVE_FILE_NAME, SYSTEM_FILE_NAME,
+    AGENTS_FILE_NAME, AGENT_CONFIG_FILE_NAME, DIRECTIVE_FILE_NAME, SKILL_MEMORY_FILE_NAME,
+    SYSTEM_FILE_NAME,
 };
 
 /// The model an agent runs on unless a test names another one.
@@ -521,4 +522,9 @@ pub fn write_agent_config_json(dir: &Path, json: &str) {
 /// Writes an agent's DIRECTIVE.md, so it opens the conversation by itself.
 pub fn write_directive(dir: &Path, directive: &str) {
     fs::write(dir.join(DIRECTIVE_FILE_NAME), directive).expect("write directive file");
+}
+
+/// Writes a SKILL_MEMORY.md into `dir`, an agent's or the project's directory.
+pub fn write_skill_memory(dir: &Path, text: &str) {
+    fs::write(dir.join(SKILL_MEMORY_FILE_NAME), text).expect("write skill memory file");
 }

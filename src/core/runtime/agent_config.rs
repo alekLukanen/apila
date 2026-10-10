@@ -1,5 +1,6 @@
 use std::{
-    fs,
+    fs::{self, File},
+    io::Read,
     path::{Path, PathBuf},
 };
 
@@ -20,6 +21,14 @@ pub const AGENTS_FILE_NAME: &str = "AGENTS.md";
 /// agent's restrictions and general guidelines. Looked up in the agent's
 /// directory first, then in the project directory.
 pub const SYSTEM_FILE_NAME: &str = "SYSTEM.md";
+/// Tells the skill memory writer what to save and how to write it. Optional,
+/// read only when skills are enabled. Looked up in the agent's directory first,
+/// then in the project directory.
+pub const SKILL_MEMORY_FILE_NAME: &str = "SKILL_MEMORY.md";
+
+/// The largest `SKILL_MEMORY.md` an agent may have, since all of it goes into
+/// every request the writer makes.
+pub const MAX_SKILL_MEMORY_BYTES: usize = 16 * 1024;
 
 /// The iteration bound of an agent that has not read its `config.json` yet.
 /// Every started agent overwrites it from its own settings, which are required
@@ -272,6 +281,9 @@ pub struct SkillsSettings {
     /// An "author/slug" id; the agent's own model unless one is named.
     pub writer_model: String,
     pub writer_max_iterations: u32,
+    /// The text of `SKILL_MEMORY.md`, trimmed; unset when there is none, which
+    /// leaves the writer on its own guidance.
+    pub instructions: Option<String>,
 }
 
 impl MemorySettings {
@@ -322,6 +334,7 @@ impl MemorySettings {
                 min_similarity,
                 writer_model,
                 writer_max_iterations,
+                instructions: None,
             }),
         })
     }
@@ -407,6 +420,7 @@ pub struct ConfigFiles {
     agents_file: ConfigFile,
     system_file: ConfigFile,
     directive_file: ConfigFile,
+    skill_memory_file: ConfigFile,
 
     /// The parsed `config.json`.
     settings: AgentSettings,
@@ -416,9 +430,9 @@ pub struct ConfigFiles {
 }
 
 impl ConfigFiles {
-    /// The system prompt may live in `project_dir` so every agent can share
-    /// one. A bad or missing `config.json` is an error, not a gap shown beside
-    /// the other files, since nothing can stand in for its model.
+    /// `SYSTEM.md` and `SKILL_MEMORY.md` may live in `project_dir` so agents can
+    /// share them. A bad `config.json` or a `SKILL_MEMORY.md` that cannot be used
+    /// is an error, not a gap shown beside the other files.
     pub fn load(dir: &Path, project_dir: &Path) -> Result<ConfigFiles, ConfigFilesError> {
         let config_path = dir.join(AGENT_CONFIG_FILE_NAME);
         let config_file = ConfigFile {
@@ -446,7 +460,7 @@ impl ConfigFiles {
         if settings.agent_max_iterations == 0 {
             return Err(ConfigFilesError::InvalidMaxIterations);
         }
-        let memory = MemorySettings::resolve(settings.memory.as_ref(), &model)
+        let mut memory = MemorySettings::resolve(settings.memory.as_ref(), &model)
             .map_err(ConfigFilesError::InvalidMemory)?;
         reject_skill_tools(&settings.tools).map_err(ConfigFilesError::InvalidMemory)?;
 
@@ -479,11 +493,29 @@ impl ConfigFiles {
             required: false,
         };
 
+        let local_skill_memory_path = dir.join(SKILL_MEMORY_FILE_NAME);
+        let skill_memory_path = if local_skill_memory_path.is_file() {
+            local_skill_memory_path
+        } else {
+            project_dir.join(SKILL_MEMORY_FILE_NAME)
+        };
+        let skill_memory_file = ConfigFile {
+            name: SKILL_MEMORY_FILE_NAME.into(),
+            present: skill_memory_path.is_file(),
+            path: skill_memory_path,
+            required: false,
+        };
+        if let Some(skills) = memory.skills.as_mut() {
+            skills.instructions =
+                read_skill_memory(&skill_memory_file).map_err(ConfigFilesError::InvalidMemory)?;
+        }
+
         Ok(ConfigFiles {
             config_file,
             agents_file,
             system_file,
             directive_file,
+            skill_memory_file,
             settings,
             model,
             memory,
@@ -547,13 +579,19 @@ impl ConfigFiles {
         }
         tools
     }
+    /// `SKILL_MEMORY.md` is listed only when skills are enabled, since it does
+    /// nothing otherwise.
     pub fn files(&self) -> Vec<ConfigFile> {
-        vec![
+        let mut files = vec![
             self.config_file.clone(),
             self.system_file.clone(),
             self.agents_file.clone(),
             self.directive_file.clone(),
-        ]
+        ];
+        if self.memory.skills_enabled() {
+            files.push(self.skill_memory_file.clone());
+        }
+        files
     }
     /// The first required file that isn't there, if any.
     pub fn missing_file(&self) -> Option<ConfigFile> {
@@ -580,5 +618,45 @@ fn reject_skill_tools(tools: &ToolSettings) -> Result<(), String> {
             name
         )),
         None => Ok(()),
+    }
+}
+
+/// The writer's instructions out of `SKILL_MEMORY.md`. A file that is absent or
+/// blank leaves none; one that cannot be read or is too large is an error.
+fn read_skill_memory(file: &ConfigFile) -> Result<Option<String>, String> {
+    if !file.present() {
+        return Ok(None);
+    }
+    let unreadable = |err: String| {
+        format!(
+            "`{}` could not be read ({}): {}",
+            SKILL_MEMORY_FILE_NAME,
+            file.path().display(),
+            err
+        )
+    };
+
+    // one byte past the limit is enough to tell the file is too large
+    let mut buf = Vec::new();
+    File::open(file.path())
+        .and_then(|f| {
+            f.take(MAX_SKILL_MEMORY_BYTES as u64 + 1)
+                .read_to_end(&mut buf)
+        })
+        .map_err(|err| unreadable(err.to_string()))?;
+    if buf.len() > MAX_SKILL_MEMORY_BYTES {
+        return Err(format!(
+            "`{}` ({}) is larger than {} bytes",
+            SKILL_MEMORY_FILE_NAME,
+            file.path().display(),
+            MAX_SKILL_MEMORY_BYTES
+        ));
+    }
+    let text = String::from_utf8(buf).map_err(|err| unreadable(err.to_string()))?;
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text).trim();
+    if text.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(text.to_string()))
     }
 }

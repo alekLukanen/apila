@@ -15,8 +15,10 @@ apila_test_agents/
       config.json
       AGENTS.md
       DIRECTIVE.md // (optional)
+      SKILL_MEMORY.md // (optional)
    config.json
    SYSTEM.md
+   SKILL_MEMORY.md // (optional)
 ```
 
 The base `config.json` should look like this
@@ -115,6 +117,13 @@ saves up to three skills from it, updating an existing skill rather than
 duplicating it. A session left open when apila closed is analysed the next time
 apila starts. A session that fails to be analysed is retried, up to three times
 in all. Sessions that end while skills are disabled are kept but never analysed.
+
+A `SKILL_MEMORY.md` tells the writer what to save and how to write each skill's
+body, in place of its default (procedures that worked, written as `## Steps`,
+`## Artifacts` and `## Pitfalls`). It is looked up in the agent's directory,
+then in the project directory, and read when the agent's config is loaded. The
+writer's limits and safety rules still apply. An empty file counts as none; one
+that cannot be read or is larger than 16 KiB stops the agent being configured.
 
 Enabling skills gives the agent two tools, which are not listed in
 `tools.enabled`:
