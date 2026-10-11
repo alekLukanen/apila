@@ -133,6 +133,22 @@ Enabling skills gives the agent two tools, which are not listed in
   above `min_similarity`.
 * `get_skill` takes an `id` and returns the whole skill.
 
+### Memory and costs in the ui
+
+Under an agent's `State:` line, `Memory:` shows how many skills it has and how
+many sessions are being or waiting to be analysed, and `Last job:` shows the
+newest analysis: its session, how it went, and the tokens and dollars it used.
+After a failed analysis the remaining sessions wait for the next `/clear`.
+
+Each agent in the list shows three costs: `sess` for the current session (reset
+by `/clear`), `all` for every session including the current one, and `mem` for
+every analysis of its sessions. Costs come from the `usage.cost` OpenRouter
+reports with each response; with your own provider key (BYOK) that is only
+OpenRouter's fee. A `~` marks a total some responses came back without a cost
+for, and `—` one where none had a cost. The `all` and `mem` totals are kept in
+the agent's `memory/memory.db`, so deleting that file resets them. The
+embeddings `search_skills` makes are not counted.
+
 ## Tools
 
 | tool | enabled by | settings |

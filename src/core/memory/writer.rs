@@ -1,16 +1,16 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::core::memory::recorder::MemoryStatus;
+use crate::core::memory::recorder::{JobState, MemoryStatus};
 use crate::core::memory::store::{
-    embed, memory_path, MemoryStore, NewSkill, SkillSummary, StoreError,
+    embed_with_usage, memory_path, MemoryStore, NewSkill, SkillSummary, SkillsSaved, StoreError,
 };
 use crate::core::openrouter::client::OpenRouter;
-use crate::core::openrouter::types::{ChatCompletionRequest, Message, ToolChoice};
+use crate::core::openrouter::types::{ChatCompletionRequest, Message, Spend, ToolChoice};
 use crate::core::runtime::agent_config::{SkillsSettings, ToolConfig, ToolSettings};
 use crate::core::runtime::helpers::{classify, Turn};
 use crate::core::runtime::tool_registry::{ToolRegistry, ToolStates};
@@ -172,10 +172,14 @@ impl WriterHandle {
     }
 }
 
+const WRITER_FAILED: &str = "memory failed";
+const JOB_COST_FAILED: &str = "recording the memory job's cost failed";
+
 fn run(jobs: Receiver<AgentJob>, openrouter: Arc<OpenRouter>, owner: String) {
     while let Ok(job) = jobs.recv() {
-        if let Err(err) = process(&job, &openrouter, &owner) {
-            job.status.set(format!("memory failed: {}", err));
+        match process(&job, &openrouter, &owner) {
+            Ok(()) => job.status.clear_prefixed(WRITER_FAILED),
+            Err(err) => job.status.set(format!("{}: {}", WRITER_FAILED, err)),
         }
     }
 }
@@ -191,71 +195,111 @@ pub fn process(job: &AgentJob, openrouter: &Arc<OpenRouter>, owner: &str) -> Res
         return Ok(());
     };
     let store = Arc::new(store);
-    store
+    let result = store
         .recover(owner, job.skills.is_some())
-        .map_err(store_failed)?;
-    let Some(skills) = &job.skills else {
-        return Ok(());
-    };
-
-    let mut analysed = 0;
-    let mut saved = 0;
-    loop {
-        let pending = store.pending_count().map_err(store_failed)?;
-        if pending == 0 {
-            break;
-        }
-        job.status.set(format!(
-            "analysing {} {}…",
-            pending,
-            plural(pending, "session")
-        ));
-        let Some(session_id) = store.claim_pending(owner).map_err(store_failed)? else {
-            break;
-        };
-        let result = analyse_session(openrouter, &store, skills, &job.dir, session_id);
-        store
-            .finish_session(session_id, result.clone().map(|_| ()))
-            .map_err(store_failed)?;
-        match result {
-            Ok(count) => {
-                analysed += 1;
-                saved += count;
-            }
-            Err(err) => return Err(err),
+        .map_err(store_failed)
+        .and_then(|_| match &job.skills {
+            Some(skills) => analyse_pending(job, openrouter, &store, skills, owner),
+            None => Ok(()),
+        });
+    // the count the ui shows went up when the session was queued
+    if result.is_err() {
+        if let Ok(pending) = store.pending_count() {
+            job.status.set_pending(pending);
         }
     }
-
-    if analysed > 0 {
-        job.status
-            .set(format!("saved {} {}", saved, plural(saved, "skill")));
-    }
-    Ok(())
+    result
 }
 
-/// Runs the writer model over one session's transcript. Returns how many
-/// skills it saved.
-fn analyse_session(
+fn analyse_pending(
+    job: &AgentJob,
     openrouter: &Arc<OpenRouter>,
     store: &Arc<MemoryStore>,
     skills: &SkillsSettings,
+    owner: &str,
+) -> Result<(), String> {
+    loop {
+        let pending = store.pending_count().map_err(store_failed)?;
+        job.status.set_pending(pending);
+        if pending == 0 {
+            return Ok(());
+        }
+        let Some((session_id, job_id)) = store.claim_pending(owner).map_err(store_failed)? else {
+            job.status.set_pending(0);
+            return Ok(());
+        };
+        job.status.job_started(session_id);
+
+        let mut run = JobRun {
+            store,
+            status: &job.status,
+            job_id,
+            spend: Spend::default(),
+        };
+        let result = analyse_session(openrouter, skills, &job.dir, session_id, &mut run);
+        let finished = store.finish_session(session_id, job_id, result.clone(), &run.spend);
+        job.status.job_finished(match &result {
+            Ok(skills) => JobState::Done { skills: *skills },
+            Err(err) => JobState::Failed(err.clone()),
+        });
+        if let Ok(count) = store.count_skills() {
+            job.status.set_skills(count);
+        }
+        finished.map_err(store_failed)?;
+        result?;
+    }
+}
+
+/// The job a session's analysis is recorded under, and what it has cost.
+struct JobRun<'a> {
+    store: &'a Arc<MemoryStore>,
+    status: &'a MemoryStatus,
+    job_id: i64,
+    spend: Spend,
+}
+
+impl JobRun<'_> {
+    /// Adds what one step cost, both to the job's row and to what the ui shows.
+    /// A failed write only means the row lags until the next one.
+    fn spent(&mut self, delta: Spend) {
+        if delta == Spend::default() {
+            return;
+        }
+        self.spend.merge(&delta);
+        match self.store.set_job_spend(self.job_id, &self.spend) {
+            Ok(()) => self.status.clear_prefixed(JOB_COST_FAILED),
+            Err(err) => self.status.set(format!("{}: {}", JOB_COST_FAILED, err)),
+        }
+        self.status.job_spent(&delta);
+    }
+}
+
+/// Runs the writer model over one session's transcript. Returns the skills
+/// it added and updated.
+fn analyse_session(
+    openrouter: &Arc<OpenRouter>,
+    skills: &SkillsSettings,
     dir: &Path,
     session_id: i64,
-) -> Result<usize, String> {
+    run: &mut JobRun<'_>,
+) -> Result<SkillsSaved, String> {
+    let store = run.store;
     let messages = store.session_messages(session_id).map_err(store_failed)?;
     if messages.is_empty() {
-        return Ok(0);
+        return Ok(SkillsSaved::default());
     }
     let existing = store
         .list_skills(MAX_EXISTING_SKILLS)
         .map_err(store_failed)?;
 
-    let saved = Arc::new(AtomicUsize::new(0));
+    let saved = Arc::new(Mutex::new(SkillsSaved::default()));
+    let embedding_spend = Arc::new(Mutex::new(Spend::default()));
     let save_skill = SaveSkillTool::new(
         skills.embedding_model.clone(),
         session_id,
         Arc::clone(&saved),
-    );
+    )
+    .set_spend(Arc::clone(&embedding_spend));
     let tools = ToolRegistry::new()
         .register(Arc::new(EndTurnTool::new()))
         .register(Arc::new(save_skill))
@@ -279,13 +323,16 @@ fn analyse_session(
         let response = openrouter
             .chat_completion(request)
             .map_err(|err| err.to_string())?;
+        let mut delta = Spend::default();
+        delta.add_response(response.usage.as_ref());
+        run.spent(delta);
         let choice = response
             .first_choice()
             .ok_or_else(|| "the model answered with no choices".to_string())?;
         conversation.push(choice.message.clone());
 
         match classify(choice) {
-            Turn::Done => return Ok(saved.load(Ordering::SeqCst)),
+            Turn::Done => return Ok(*saved.lock().expect("mutex error")),
             Turn::Failed(err) => return Err(err),
             Turn::Continue => {
                 let mut ends_turn = false;
@@ -294,8 +341,11 @@ fn analyse_session(
                     ends_turn |= result.ends_turn();
                     conversation.push(result.message());
                 }
+                // drained rather than read, so no embedding is counted twice
+                let embedded = std::mem::take(&mut *embedding_spend.lock().expect("mutex error"));
+                run.spent(embedded);
                 if ends_turn {
-                    return Ok(saved.load(Ordering::SeqCst));
+                    return Ok(*saved.lock().expect("mutex error"));
                 }
             }
         }
@@ -407,14 +457,6 @@ pub fn head_and_tail(text: String, limit: usize) -> String {
     )
 }
 
-fn plural(count: usize, noun: &str) -> String {
-    if count == 1 {
-        noun.to_string()
-    } else {
-        format!("{}s", noun)
-    }
-}
-
 fn store_failed(err: StoreError) -> String {
     err.to_string()
 }
@@ -429,21 +471,29 @@ pub const SAVE_SKILL: &str = "save_skill";
 pub struct SaveSkillTool {
     embedding_model: String,
     source_session: i64,
-    /// How many skills this session has saved, shared with the writer.
-    saved: Arc<AtomicUsize>,
+    /// The skills this session has added and updated, shared with the writer.
+    saved: Arc<Mutex<SkillsSaved>>,
+    /// What embedding the skills cost since the writer last took it.
+    spend: Arc<Mutex<Spend>>,
 }
 
 impl SaveSkillTool {
     pub fn new(
         embedding_model: String,
         source_session: i64,
-        saved: Arc<AtomicUsize>,
+        saved: Arc<Mutex<SkillsSaved>>,
     ) -> SaveSkillTool {
         SaveSkillTool {
             embedding_model,
             source_session,
             saved,
+            spend: Arc::default(),
         }
+    }
+
+    pub fn set_spend(mut self, spend: Arc<Mutex<Spend>>) -> SaveSkillTool {
+        self.spend = spend;
+        self
     }
 }
 
@@ -484,6 +534,7 @@ impl Tool for SaveSkillTool {
             embedding_model: self.embedding_model.clone(),
             source_session: self.source_session,
             saved: Arc::clone(&self.saved),
+            spend: Arc::clone(&self.spend),
         }))
     }
 }
@@ -491,7 +542,8 @@ impl Tool for SaveSkillTool {
 pub struct SaveSkillState {
     embedding_model: String,
     source_session: i64,
-    saved: Arc<AtomicUsize>,
+    saved: Arc<Mutex<SkillsSaved>>,
+    spend: Arc<Mutex<Spend>>,
 }
 
 impl ToolState for SaveSkillState {
@@ -515,7 +567,7 @@ impl ToolState for SaveSkillState {
                 expected: format!("at most {} bytes", MAX_SKILL_BODY_BYTES),
             });
         }
-        if self.saved.load(Ordering::SeqCst) >= MAX_SKILLS_PER_SESSION {
+        if self.saved.lock().expect("mutex error").total() >= MAX_SKILLS_PER_SESSION {
             return Err(ToolError::Rejected {
                 error: format!(
                     "at most {} skills may be saved from one session; call end_turn",
@@ -529,12 +581,19 @@ impl ToolState for SaveSkillState {
                 error: "the writer has no model or memory database to save with".into(),
             });
         };
-        let embedding = embed(
+        let (embedded, usage) = embed_with_usage(
             &openrouter,
             &self.embedding_model,
             &format!("{}\n{}", name, when_to_use),
-        )
-        .map_err(|error| ToolError::Failed {
+        );
+        // a request that never got an answer was not charged for
+        if usage.is_some() || embedded.is_ok() {
+            self.spend
+                .lock()
+                .expect("mutex error")
+                .add_response(usage.as_ref());
+        }
+        let embedding = embedded.map_err(|error| ToolError::Failed {
             error: format!("the skill could not be embedded: {}", error),
         })?;
         let (id, created) = store
@@ -549,7 +608,14 @@ impl ToolState for SaveSkillState {
             .map_err(|err| ToolError::Failed {
                 error: err.to_string(),
             })?;
-        self.saved.fetch_add(1, Ordering::SeqCst);
+        {
+            let mut saved = self.saved.lock().expect("mutex error");
+            if created {
+                saved.added += 1;
+            } else {
+                saved.updated += 1;
+            }
+        }
 
         Ok(ToolOutput::new(format!(
             "saved skill `{}` (id {}, {})",

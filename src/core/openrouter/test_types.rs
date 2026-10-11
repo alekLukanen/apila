@@ -2,8 +2,8 @@ use serde_json::json;
 
 use super::types::{
     ApiErrorBody, ChatCompletionRequest, ChatCompletionResponse, EmbeddingRequest,
-    EmbeddingResponse, FinishReason, FunctionCall, Message, Reasoning, ReasoningEffort, Tool,
-    ToolCall, ToolChoice,
+    EmbeddingResponse, FinishReason, FunctionCall, Message, Reasoning, ReasoningEffort, Spend,
+    Tool, ToolCall, ToolChoice, Usage,
 };
 
 #[test]
@@ -333,4 +333,99 @@ fn an_embedding_response_deserializes_with_extra_fields() {
     assert_eq!(response.data.len(), 1);
     assert_eq!(response.data[0].embedding, vec![0.25, -0.5]);
     assert_eq!(response.usage.expect("usage").prompt_tokens, 3);
+}
+
+fn usage(total_tokens: u32, cost: Option<f64>) -> Usage {
+    Usage {
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        total_tokens,
+        cost,
+    }
+}
+
+#[test]
+fn a_chat_usage_cost_parses_and_is_none_when_absent() {
+    let priced: ChatCompletionResponse = serde_json::from_value(json!({
+        "id": "gen-1",
+        "model": "m",
+        "choices": [],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.0025},
+    }))
+    .expect("deserialize");
+    assert_eq!(priced.usage.expect("usage").cost, Some(0.0025));
+
+    let unpriced: ChatCompletionResponse = serde_json::from_value(json!({
+        "id": "gen-1",
+        "model": "m",
+        "choices": [],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+    }))
+    .expect("deserialize");
+    assert_eq!(unpriced.usage.expect("usage").cost, None);
+}
+
+#[test]
+fn an_embedding_usage_cost_parses_and_is_none_when_absent() {
+    let priced: EmbeddingResponse = serde_json::from_value(json!({
+        "data": [],
+        "usage": {"prompt_tokens": 3, "total_tokens": 3, "cost": 0.000001},
+    }))
+    .expect("deserialize");
+    assert_eq!(priced.usage.expect("usage").cost, Some(0.000001));
+
+    let unpriced: EmbeddingResponse = serde_json::from_value(json!({
+        "data": [],
+        "usage": {"prompt_tokens": 3, "total_tokens": 3},
+    }))
+    .expect("deserialize");
+    assert_eq!(unpriced.usage.expect("usage").cost, None);
+}
+
+#[test]
+fn spend_counts_a_missing_usage_or_cost_as_unpriced() {
+    let mut spend = Spend::default();
+    spend.add_response(None);
+    assert_eq!(spend, Spend::new(0, 0, 1));
+
+    spend.add_response(Some(&usage(40, None)));
+    assert_eq!(spend, Spend::new(40, 0, 2));
+    assert!(!spend.priced());
+
+    spend.add_response(Some(&usage(10, Some(f64::NAN))));
+    assert_eq!(spend, Spend::new(50, 0, 3));
+}
+
+#[test]
+fn spend_sums_priced_responses() {
+    let mut spend = Spend::default();
+    spend
+        .add_response(Some(&usage(100, Some(0.0001))))
+        .add_response(Some(&usage(20, Some(0.0002))));
+
+    assert_eq!(spend, Spend::new(120, 300_000, 0));
+    assert!(spend.priced());
+    assert!((spend.cost_usd() - 0.0003).abs() < 1e-12);
+}
+
+#[test]
+fn spend_rounds_to_the_nearest_nanodollar_and_clamps() {
+    let mut spend = Spend::default();
+    spend.add_response(Some(&usage(0, Some(0.0000000016))));
+    assert_eq!(spend.cost_nanos, 2);
+
+    let mut huge = Spend::default();
+    huge.add_response(Some(&usage(0, Some(1e30))));
+    assert_eq!(huge.cost_nanos, i64::MAX);
+
+    let mut negative = Spend::default();
+    negative.add_response(Some(&usage(0, Some(-1e30))));
+    assert_eq!(negative.cost_nanos, i64::MIN);
+}
+
+#[test]
+fn spend_merge_adds_every_field() {
+    let mut total = Spend::new(10, 5, 1);
+    total.merge(&Spend::new(3, 7, 2));
+    assert_eq!(total, Spend::new(13, 12, 3));
 }

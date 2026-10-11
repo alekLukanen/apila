@@ -2,10 +2,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crossterm::event::KeyModifiers;
+use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::{
     crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind},
-    layout::{Constraint, Layout, Rect},
+    layout::{Constraint, Layout, Position, Rect},
     style::{Color, Style, Stylize},
     symbols::border,
     text::{Line, Span, Text},
@@ -17,13 +17,22 @@ use thiserror::Error;
 use clap::Parser;
 
 use crate::core::config::config;
-use crate::core::openrouter::types::Message;
+use crate::core::memory::recorder::{JobState, MemoryJob, MemoryView};
+use crate::core::memory::store::SkillsSaved;
+use crate::core::openrouter::types::{Message, Spend};
 use crate::core::runtime::agent::{AgentDefinition, AgentState, ClearOutcome};
 use crate::core::runtime::{agent_config, runtime};
+
+use super::chat_input::{ChatInput, INPUT_MAX_ROWS};
+use super::scroll::{self, ChatScroll, WHEEL_LINES};
 
 /// How long the ui waits for a key before redrawing. Agents answer on
 /// background threads, so the screen has to refresh without any input.
 const TICK: Duration = Duration::from_millis(100);
+
+/// Events already waiting are handled before the next redraw, so a fast flick
+/// of the wheel doesn't cost a frame per tick. Capped so the screen still moves.
+const MAX_QUEUED_EVENTS: usize = 64;
 
 /// TODO: read the real context window off the model once it is available.
 const CONTEXT_LIMIT_TOKENS: u64 = 1_000_000;
@@ -35,7 +44,11 @@ const TOOL_OUTPUT_LINES: usize = 12;
 /// The column a tab advances to. Terminals use eight and files are written
 /// expecting it, so anything else would misalign the thing the transcript is
 /// trying to show faithfully.
-const TAB_WIDTH: usize = 8;
+pub(super) const TAB_WIDTH: usize = 8;
+
+/// The widest a figure on an agent row's cost line may be, so the whole line
+/// fits the narrowest list a normal terminal gives it.
+const COMPACT_COST_WIDTH: usize = 5;
 
 /// Typed into the chat, ends the agent's session and starts a new one.
 const CLEAR_COMMAND: &str = "/clear";
@@ -77,6 +90,17 @@ enum Focus {
     Chat,
 }
 
+/// Where the selected agent's chat was last drawn, so the wheel and paging keys
+/// know what they are scrolling and Up/Down know how the input wraps.
+#[derive(Debug, Clone)]
+struct ChatView {
+    agent_id: String,
+    transcript_area: Rect,
+    max_top: usize,
+    height: usize,
+    input_width: usize,
+}
+
 #[derive(Debug)]
 pub struct TUIApp {
     args: Args,
@@ -84,7 +108,12 @@ pub struct TUIApp {
 
     agents_table_state: TableState,
     /// The half typed chat message for each agent.
-    chat_inputs: HashMap<String, String>,
+    chat_inputs: HashMap<String, ChatInput>,
+    /// How far back each agent's transcript is scrolled. Missing means it
+    /// follows the newest output.
+    chat_scroll: HashMap<String, ChatScroll>,
+    /// Set while drawing a chat session, and cleared before every redraw.
+    chat_view: Option<ChatView>,
     /// True while typing into the selected agent's chat box.
     chat_focused: bool,
     /// Shown along the bottom of the detail window until the next key press.
@@ -125,6 +154,8 @@ impl TUIApp {
             rt,
             agents_table_state,
             chat_inputs: HashMap::new(),
+            chat_scroll: HashMap::new(),
+            chat_view: None,
             chat_focused: false,
             status_message: None,
             info_message: None,
@@ -140,7 +171,7 @@ impl TUIApp {
 
         while !self.exit {
             term.draw(|frame| self.draw(frame))?;
-            self.handle_key_events()?;
+            self.handle_events()?;
         }
 
         Ok(())
@@ -149,19 +180,37 @@ impl TUIApp {
     // Input /////////////////////////////
     //////////////////////////////////////
 
-    fn handle_key_events(&mut self) -> Result<(), TUIAppError> {
+    fn handle_events(&mut self) -> Result<(), TUIAppError> {
         // agents answer on their own threads; the wait has to time out so the
         // screen keeps up with them
         if !event::poll(TICK)? {
             return Ok(());
         }
+        self.handle_event(event::read()?)?;
 
-        let key = match event::read()? {
-            Event::Key(key) if key.kind == KeyEventKind::Press => key,
-            _ => return Ok(()),
-        };
+        for _ in 0..MAX_QUEUED_EVENTS {
+            if self.exit || !event::poll(Duration::ZERO)? {
+                break;
+            }
+            self.handle_event(event::read()?)?;
+        }
+        Ok(())
+    }
 
-        self.handle_key(key)
+    /// Acts on one terminal event, the way the event loop would.
+    pub fn handle_event(&mut self, event: Event) -> Result<(), TUIAppError> {
+        match event {
+            Event::Key(key) if key.kind == KeyEventKind::Press => self.handle_key(key),
+            Event::Mouse(mouse) => {
+                self.handle_mouse(mouse);
+                Ok(())
+            }
+            Event::Paste(text) => {
+                self.handle_paste(&text);
+                Ok(())
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Acts on one key press, whichever window has focus.
@@ -177,6 +226,17 @@ impl TUIApp {
         } = key
         {
             self.exit = true;
+            return Ok(());
+        }
+
+        // the transcript scrolls whichever window has focus
+        let page = match key.code {
+            KeyCode::PageUp => Some(-1),
+            KeyCode::PageDown => Some(1),
+            _ => None,
+        };
+        if let Some(direction) = page {
+            self.page_chat(direction);
             return Ok(());
         }
 
@@ -227,36 +287,126 @@ impl TUIApp {
         let Some(id) = self.selected_agent_id() else {
             return Ok(());
         };
+        // Up/Down follow the rows as drawn; with nothing drawn yet they fall
+        // back to the lines as typed
+        let width = self
+            .selected_chat_view()
+            .map(|view| view.input_width)
+            .unwrap_or(usize::MAX);
+        let modifiers = key.modifiers;
 
         match key.code {
             KeyCode::Esc => self.chat_focused = false,
-            KeyCode::Backspace => {
-                if let Some(input) = self.chat_inputs.get_mut(&id) {
-                    input.pop();
-                }
+            KeyCode::Enter if modifiers.is_empty() => self.send_chat_input(&id),
+            KeyCode::Enter if modifiers == KeyModifiers::ALT => {
+                self.chat_input(&id).insert_newline()
             }
-            KeyCode::Enter => {
-                let content = self.chat_inputs.get(&id).cloned().unwrap_or_default();
-                if content.trim() == "" {
-                    return Ok(());
-                }
-                if content.trim() == CLEAR_COMMAND {
-                    self.clear_session(&id);
-                    return Ok(());
-                }
-                match self.rt.send_agent_message(&id, content) {
-                    Ok(_) => {
-                        self.chat_inputs.remove(&id);
-                    }
-                    Err(err) => self.status_message = Some(err.to_string()),
-                }
+            KeyCode::Char('j') if modifiers == KeyModifiers::CONTROL => {
+                self.chat_input(&id).insert_newline()
             }
-            KeyCode::Char(c) => {
-                self.chat_inputs.entry(id).or_default().push(c);
+            KeyCode::Left => self.chat_input(&id).move_left(),
+            KeyCode::Right => self.chat_input(&id).move_right(),
+            KeyCode::Up => self.chat_input(&id).move_up(width),
+            KeyCode::Down => self.chat_input(&id).move_down(width),
+            KeyCode::Home => self.chat_input(&id).home(),
+            KeyCode::End => self.chat_input(&id).end(),
+            KeyCode::Backspace => self.chat_input(&id).backspace(),
+            KeyCode::Delete => self.chat_input(&id).delete(),
+            KeyCode::Char(c)
+                if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.chat_input(&id).insert_char(c)
             }
             _ => {}
         }
         Ok(())
+    }
+
+    fn chat_input(&mut self, id: &str) -> &mut ChatInput {
+        self.chat_inputs.entry(id.to_string()).or_default()
+    }
+
+    fn send_chat_input(&mut self, id: &str) {
+        let content = self
+            .chat_inputs
+            .get(id)
+            .map(|input| input.text().to_string())
+            .unwrap_or_default();
+        if content.trim() == "" {
+            return;
+        }
+        if content.trim() == CLEAR_COMMAND {
+            self.clear_session(id);
+            return;
+        }
+        match self.rt.send_agent_message(id, content) {
+            Ok(_) => {
+                self.chat_inputs.remove(id);
+                self.chat_scroll.remove(id);
+            }
+            Err(err) => self.status_message = Some(err.to_string()),
+        }
+    }
+
+    /// Only the wheel does anything; clicks are reported too but ignored.
+    fn handle_mouse(&mut self, mouse: MouseEvent) {
+        let delta = match mouse.kind {
+            MouseEventKind::ScrollUp => -(WHEEL_LINES as isize),
+            MouseEventKind::ScrollDown => WHEEL_LINES as isize,
+            _ => return,
+        };
+        let Some(view) = self.selected_chat_view() else {
+            return;
+        };
+        if view
+            .transcript_area
+            .contains(Position::new(mouse.column, mouse.row))
+        {
+            self.scroll_chat(&view, delta);
+        }
+    }
+
+    /// A paste outside the chat would otherwise run as a string of key
+    /// commands, so it goes nowhere.
+    fn handle_paste(&mut self, text: &str) {
+        if self.focus() != Focus::Chat {
+            return;
+        }
+        if let Some(id) = self.selected_agent_id() {
+            self.chat_input(&id).insert_str(text);
+        }
+    }
+
+    /// Scrolls the selected agent's transcript by a page, `direction` being
+    /// negative to go back.
+    fn page_chat(&mut self, direction: isize) {
+        if let Some(view) = self.selected_chat_view() {
+            let lines = scroll::page_lines(view.height) as isize;
+            self.scroll_chat(&view, direction * lines);
+        }
+    }
+
+    fn scroll_chat(&mut self, view: &ChatView, delta: isize) {
+        let state = self
+            .chat_scroll
+            .get(&view.agent_id)
+            .copied()
+            .unwrap_or_default();
+        match scroll::scrolled(state, delta, view.max_top) {
+            ChatScroll::Follow => {
+                self.chat_scroll.remove(&view.agent_id);
+            }
+            top => {
+                self.chat_scroll.insert(view.agent_id.clone(), top);
+            }
+        }
+    }
+
+    /// The last drawn chat, if it is the selected agent's. Another agent may
+    /// have been selected since, and its chat isn't on screen yet.
+    fn selected_chat_view(&self) -> Option<ChatView> {
+        let view = self.chat_view.as_ref()?;
+        (Some(&view.agent_id) == self.selected_agent_id().as_ref()).then(|| view.clone())
     }
 
     /// `/clear` ends the session rather than going to the model as a message.
@@ -264,6 +414,7 @@ impl TUIApp {
         match self.rt.clear_agent_session(id) {
             Ok(outcome) => {
                 self.chat_inputs.remove(id);
+                self.chat_scroll.remove(id);
                 self.info_message = Some(match outcome {
                     ClearOutcome::Cleared => "session cleared".into(),
                     ClearOutcome::Queued => "clear queued — runs when this turn ends".into(),
@@ -364,6 +515,8 @@ impl TUIApp {
             ],
             Focus::Chat => vec![
                 ("Send", " <Enter>"),
+                ("Newline", " <Alt+Enter>"),
+                ("Scroll", " <PgUp/PgDn>"),
                 ("New Session", " /clear"),
                 ("Leave Chat", " <Esc>"),
                 ("Quit", " <Ctrl+C>"),
@@ -452,8 +605,9 @@ impl TUIApp {
                     ]),
                     Line::from(vec![Span::from("  "), config.model_label().into()]).cyan(),
                     Self::context_usage_line(context_used, CONTEXT_LIMIT_TOKENS, detail_width),
+                    Self::agent_cost_line(agent_definition, detail_width),
                 ])])
-                .height(3)
+                .height(4)
             })
             .collect();
 
@@ -518,6 +672,144 @@ impl TUIApp {
         ])
     }
 
+    /// What the agent's chat and memory have cost. Totals kept in the memory
+    /// database show `…` until they have been read.
+    fn agent_cost_line(definition: &AgentDefinition, width: usize) -> Line<'static> {
+        let memory = definition.memory_view();
+        let (all, mem) = if memory.loaded {
+            (
+                Some(definition.all_sessions_spend()),
+                Some(memory.memory_spend()),
+            )
+        } else {
+            (None, None)
+        };
+        Self::cost_line(definition.session_spend(), all, mem, width)
+    }
+
+    /// `sess $0.04 all $0.42 mem $0.03`, cut to `width` when it cannot fit.
+    pub(super) fn cost_line(
+        session: Spend,
+        all: Option<Spend>,
+        mem: Option<Spend>,
+        width: usize,
+    ) -> Line<'static> {
+        let figure = |spend: Option<Spend>| {
+            spend
+                .map(|spend| Self::compact_cost(&spend))
+                .unwrap_or_else(|| "…".to_string())
+        };
+        let parts = [
+            ("sess", figure(Some(session))),
+            ("all", figure(all)),
+            ("mem", figure(mem)),
+        ];
+        let plain = parts
+            .iter()
+            .map(|(label, value)| format!("{} {}", label, value))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let length = plain.chars().count();
+        if length > width {
+            return Line::from(Self::one_line(&plain, width)).dark_gray();
+        }
+
+        let mut spans = Vec::new();
+        if length < width {
+            spans.push(Span::from(" "));
+        }
+        for (index, (label, value)) in parts.into_iter().enumerate() {
+            let gap = if index == 0 { "" } else { " " };
+            spans.push(Span::from(format!("{}{} ", gap, label)).dark_gray());
+            spans.push(Span::from(value).cyan());
+        }
+        Line::from(spans)
+    }
+
+    /// A cost in at most [`COMPACT_COST_WIDTH`] characters, losing precision
+    /// as it grows. `~` marks a total some responses left unpriced.
+    pub(super) fn compact_cost(spend: &Spend) -> String {
+        let nanos = i128::from(spend.cost_nanos.max(0));
+        if spend.unpriced > 0 && nanos == 0 {
+            return "—".to_string();
+        }
+        let prefix = if spend.unpriced > 0 { "~" } else { "" };
+        if nanos == 0 {
+            return "$0".to_string();
+        }
+
+        // each tier is a unit in nanodollars and the decimals shown in it
+        const TIERS: [(i128, u32, &str); 6] = [
+            (1_000_000_000, 2, ""),
+            (1_000_000_000, 1, ""),
+            (1_000_000_000, 0, ""),
+            (1_000_000_000_000, 0, "k"),
+            (1_000_000_000_000_000, 0, "M"),
+            (1_000_000_000_000_000_000, 0, "B"),
+        ];
+        for (unit, decimals, suffix) in TIERS {
+            let step = unit / 10i128.pow(decimals);
+            let rounded = (nanos + step / 2) / step;
+            if rounded == 0 {
+                continue;
+            }
+            let scale = 10i128.pow(decimals);
+            let (whole, fraction) = (rounded / scale, rounded % scale);
+            let number = match (decimals, whole) {
+                (0, _) => whole.to_string(),
+                // below a dollar the leading zero is the first thing to go
+                (_, 0) => format!(".{:0width$}", fraction, width = decimals as usize),
+                _ => format!("{}.{:0width$}", whole, fraction, width = decimals as usize),
+            };
+            let candidates = if decimals > 0 && whole == 0 {
+                vec![
+                    format!("{}$0{}", prefix, number),
+                    format!("{}${}", prefix, number),
+                ]
+            } else {
+                vec![format!("{}${}{}", prefix, number, suffix)]
+            };
+            if let Some(text) = candidates
+                .into_iter()
+                .find(|text| text.chars().count() <= COMPACT_COST_WIDTH)
+            {
+                return text;
+            }
+        }
+        // under a cent: too small to show, and too small to matter when partial
+        if spend.unpriced > 0 {
+            "~$0".to_string()
+        } else {
+            "<$.01".to_string()
+        }
+    }
+
+    /// A cost for the detail pane, with more precision the smaller it is.
+    pub(super) fn human_cost(spend: &Spend) -> String {
+        let nanos = i128::from(spend.cost_nanos.max(0));
+        if spend.unpriced > 0 && nanos == 0 {
+            return "—".to_string();
+        }
+        let prefix = if spend.unpriced > 0 { "~" } else { "" };
+        let text = if nanos == 0 {
+            "$0".to_string()
+        } else if nanos < 100_000 {
+            "<$0.0001".to_string()
+        } else {
+            // the precision is picked after rounding, so 0.009996 reads $0.01
+            let ten_thousandths = (nanos + 50_000) / 100_000;
+            let cents = (nanos + 5_000_000) / 10_000_000;
+            if ten_thousandths < 100 {
+                format!("$0.{:04}", ten_thousandths)
+            } else if cents < 10_000 {
+                format!("${}.{:02}", cents / 100, cents % 100)
+            } else {
+                format!("${}", (nanos + 500_000_000) / 1_000_000_000)
+            }
+        };
+        format!("{}{}", prefix, text)
+    }
+
     /// Format a token count compactly: 950 -> "950", 24_000 -> "24k", 1_000_000 -> "1M"
     fn human_tokens(tokens: u64) -> String {
         match tokens {
@@ -541,6 +833,7 @@ impl TUIApp {
             .border_style(Style::default().cyan());
         let inner = block.inner(area);
         frame.render_widget(block, area);
+        self.chat_view = None;
 
         let Some(definition) = self.selected_agent() else {
             let project_dir = self.rt.config().project_dir();
@@ -645,13 +938,95 @@ impl TUIApp {
                 Span::from(state.label()).style(Style::default().fg(Self::state_color(&state))),
             ]),
         ];
-        if let Some(memory) = definition.memory_status() {
+        lines.extend(Self::memory_lines(
+            &definition.memory_view(),
+            config.memory().skills.is_some(),
+        ));
+        lines
+    }
+
+    /// The `Memory:` line, the newest job's, and any error, shown under `State:`.
+    pub(super) fn memory_lines(view: &MemoryView, skills_on: bool) -> Vec<Line<'static>> {
+        let labelled = |label: &'static str, text: String| {
+            Line::from(vec![Span::from(label).dark_gray(), Span::from(text).blue()])
+        };
+        let mut lines = Vec::new();
+        if skills_on {
+            let skills = match view.skills {
+                Some(count) => format!("{} {}", count, plural(count, "skill")),
+                None => "…".to_string(),
+            };
+            lines.push(labelled(
+                "Memory:    ",
+                format!("{} · {}", skills, Self::jobs_summary(view)),
+            ));
+            lines.push(labelled(
+                "Last job:  ",
+                Self::job_summary(view.last_job.as_ref()),
+            ));
+        } else {
+            lines.push(labelled("Memory:    ", "skills off".to_string()));
+            if view.last_job.is_some() {
+                lines.push(labelled(
+                    "Last job:  ",
+                    Self::job_summary(view.last_job.as_ref()),
+                ));
+            }
+        }
+        if let Some(message) = &view.message {
             lines.push(Line::from(vec![
-                Span::from("Memory:    ").dark_gray(),
-                Span::from(memory).blue(),
+                Span::from("Status:    ").dark_gray(),
+                Span::from(message.clone()).red(),
             ]));
         }
         lines
+    }
+
+    /// How many sessions are being or waiting to be analysed. After a failure
+    /// the writer stops, so the rest wait for the next `/clear`.
+    fn jobs_summary(view: &MemoryView) -> String {
+        let pending = view.pending.unwrap_or(0);
+        if view.stalled() && pending > 0 {
+            return format!(
+                "{} {} pending (retries on next {})",
+                pending,
+                plural(pending, "job"),
+                CLEAR_COMMAND
+            );
+        }
+        match pending + usize::from(view.job_running()) {
+            0 => "no jobs running".to_string(),
+            count => format!("{} {} running", count, plural(count, "job")),
+        }
+    }
+
+    /// `session #7 · added 2 skills · 14k tok · $0.0031`, or `none yet`.
+    pub(super) fn job_summary(job: Option<&MemoryJob>) -> String {
+        let Some(job) = job else {
+            return "none yet".to_string();
+        };
+        let state = match &job.state {
+            JobState::Running => "analysing".to_string(),
+            JobState::Done { skills } => Self::skills_summary(skills),
+            JobState::Failed(err) => format!("failed: {}", Self::one_line(err, usize::MAX)),
+            JobState::Interrupted => "interrupted".to_string(),
+        };
+        format!(
+            "session #{} · {} · {} tok · {}",
+            job.session_id,
+            state,
+            Self::human_tokens(job.spend.tokens),
+            Self::human_cost(&job.spend)
+        )
+    }
+
+    fn skills_summary(skills: &SkillsSaved) -> String {
+        match (skills.added, skills.updated) {
+            (0, 0) => "saved 0 skills".to_string(),
+            (added, 0) => format!("added {} {}", added, plural(added, "skill")),
+            (0, updated) => format!("updated {} {}", updated, plural(updated, "skill")),
+            (added, updated) => format!("added {} · updated {}", added, updated),
+        }
     }
 
     fn render_configuring(&mut self, definition: &AgentDefinition, area: Rect, frame: &mut Frame) {
@@ -720,7 +1095,20 @@ impl TUIApp {
     /// The running agent's chat session: the transcript with an input box
     /// underneath it.
     fn render_session(&mut self, definition: &AgentDefinition, area: Rect, frame: &mut Frame) {
-        let layout = Layout::vertical([Constraint::Fill(1), Constraint::Length(3)]);
+        let id = definition.id();
+        let focused = self.focus() == Focus::Chat;
+
+        // one column is kept free so the cursor has somewhere to sit at the end
+        // of a full row
+        let input_width = (area.width.saturating_sub(2) as usize)
+            .saturating_sub(1)
+            .max(1);
+        let window = self.chat_input(&id).window(input_width, INPUT_MAX_ROWS);
+
+        let layout = Layout::vertical([
+            Constraint::Fill(1),
+            Constraint::Length(window.lines.len() as u16 + 2),
+        ]);
         let [transcript_area, input_area] = layout.areas(area);
 
         let width = transcript_area.width.max(1) as usize;
@@ -763,18 +1151,39 @@ impl TUIApp {
             }
         }
 
-        // keep the newest output on screen
         let height = transcript_area.height as usize;
-        let scroll = lines.len().saturating_sub(height) as u16;
-        frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), transcript_area);
+        let total = lines.len();
+        let max_top = total.saturating_sub(height);
+        // a transcript that shrank under a held position follows again
+        let state = match self.chat_scroll.get(&id).copied() {
+            Some(ChatScroll::Top(top)) if top < max_top => ChatScroll::Top(top),
+            _ => {
+                self.chat_scroll.remove(&id);
+                ChatScroll::Follow
+            }
+        };
+        let top = scroll::visible_top(state, max_top);
+        let mut shown: Vec<Line> = lines.into_iter().skip(top).take(height).collect();
+        if top < max_top && height >= 2 {
+            shown.pop();
+            let hidden = total - (top + shown.len());
+            shown.push(
+                Line::from(format!("↓ {} more lines — PgDn or scroll down", hidden))
+                    .dark_gray()
+                    .italic(),
+            );
+        }
+        frame.render_widget(Paragraph::new(shown), transcript_area);
 
-        let focused = self.focus() == Focus::Chat;
-        let input = self
-            .chat_inputs
-            .get(&definition.id())
-            .cloned()
-            .unwrap_or_default();
-        let input_block = Block::bordered()
+        self.chat_view = Some(ChatView {
+            agent_id: id,
+            transcript_area,
+            max_top,
+            height,
+            input_width,
+        });
+
+        let mut input_block = Block::bordered()
             .border_set(border::ROUNDED)
             .border_style(if focused {
                 Style::default().cyan()
@@ -787,12 +1196,38 @@ impl TUIApp {
                 " <Enter> to chat "
             });
 
-        let text = if focused {
-            Line::from(vec![Span::from(input), Span::from("▏").cyan()])
+        if focused && (window.hidden_above || window.hidden_below) {
+            let arrows = match (window.hidden_above, window.hidden_below) {
+                (true, true) => " ↑↓ ",
+                (true, false) => " ↑ ",
+                _ => " ↓ ",
+            };
+            input_block = input_block.title_top(Line::from(arrows).dark_gray().right_aligned());
+        }
+        let inner = input_block.inner(input_area);
+
+        let style = if focused {
+            Style::default()
         } else {
-            Line::from(input).dark_gray()
+            Style::default().dark_gray()
         };
+        let text: Vec<Line> = window
+            .lines
+            .into_iter()
+            .map(|line| Line::from(line).style(style))
+            .collect();
         frame.render_widget(Paragraph::new(text).block(input_block), input_area);
+
+        // an area too small to hold the box has nowhere to put the cursor
+        if focused
+            && window.cursor_row < inner.height as usize
+            && window.cursor_col < inner.width as usize
+        {
+            frame.set_cursor_position(Position::new(
+                inner.x + window.cursor_col as u16,
+                inner.y + window.cursor_row as u16,
+            ));
+        }
     }
 
     /// One message rendered as a labeled block, hard wrapped to `width` so the
@@ -929,5 +1364,13 @@ impl TUIApp {
             }
         }
         out
+    }
+}
+
+fn plural(count: usize, noun: &str) -> String {
+    if count == 1 {
+        noun.to_string()
+    } else {
+        format!("{}s", noun)
     }
 }

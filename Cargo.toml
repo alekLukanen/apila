@@ -40,3 +40,5 @@ turso_parser = "0.8.1"
 scraper = "0.27.0"
 # the `search` argument of `read_webpage_data`
 regex = "1.13.1"
+# grapheme boundaries for moving and deleting in the chat input
+unicode-segmentation = "1.13.3"

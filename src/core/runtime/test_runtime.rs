@@ -1,8 +1,11 @@
 use std::{fs, path::Path, time::Duration};
 
 use crate::core::config::config::Config;
-use crate::core::memory::store::{memory_path, MemoryStore, SessionRecord, SessionStatus};
-use crate::core::openrouter::types::Message;
+use crate::core::memory::recorder::JobState;
+use crate::core::memory::store::{
+    memory_path, MemoryStore, SessionRecord, SessionStatus, SkillsSaved,
+};
+use crate::core::openrouter::types::{Message, Spend};
 use crate::core::runtime::agent::AgentState;
 use crate::core::runtime::agent_config::{
     ConfigFilesError, AGENTS_FILE_NAME, AGENT_CONFIG_FILE_NAME, SYSTEM_FILE_NAME,
@@ -12,7 +15,7 @@ use crate::core::test_support::{
     project_with_delayed_server, project_with_routes, project_with_script, project_with_server,
     wait_until, write_agent_config, write_agent_config_json, write_agent_config_with_skills,
     write_agent_config_with_tools, write_directive, write_skill_memory, Route, StubOpenRouter,
-    StubReply, TEST_MODEL, TEST_WRITER_MODEL,
+    StubReply, STUB_CHAT_TOKENS, TEST_MODEL, TEST_WRITER_MODEL,
 };
 
 use super::agent::ClearOutcome;
@@ -1560,8 +1563,12 @@ fn a_cleared_session_is_analysed_into_a_skill_when_skills_are_on() {
     assert_eq!(skills.len(), 1);
     assert_eq!(skills[0].name, "fetch-webpage-into-sqlite");
     wait_until("the status to say so", || {
-        rt.agent("builder").unwrap().memory_status().as_deref() == Some("saved 1 skill")
+        let view = rt.agent("builder").unwrap().memory_view();
+        view.skills == Some(1)
+            && view.pending == Some(0)
+            && view.last_job.is_some_and(|job| job.state == added_one())
     });
+    assert_eq!(rt.agent("builder").unwrap().memory_status(), None);
     assert!(server.chat_requests(TEST_WRITER_MODEL)[0].contains("save hacker news"));
 }
 
@@ -1749,4 +1756,157 @@ fn an_agent_without_skills_is_not_offered_the_skill_tools() {
         sent_tool_names(&server.requests()[0]),
         vec!["end_turn", "bash"]
     );
+}
+
+// Costs /////////////////////////////
+//////////////////////////////////////
+
+/// What `replies` scripted chat replies cost together.
+fn chat_spend(replies: u64) -> Spend {
+    Spend::new(replies * STUB_CHAT_TOKENS, replies as i64 * 100_000, 0)
+}
+
+fn wait_until_loaded(rt: &Runtime, id: &str) {
+    wait_until("the memory totals to be read", || {
+        rt.agent(id).expect("agent exists").memory_view().loaded
+    });
+}
+
+fn wait_until_job_done(rt: &Runtime, id: &str) {
+    wait_until("the memory job to finish", || {
+        let view = rt.agent(id).expect("agent exists").memory_view();
+        view.pending == Some(0)
+            && view
+                .last_job
+                .is_some_and(|job| matches!(job.state, JobState::Done { .. }))
+    });
+}
+
+#[test]
+fn the_session_cost_resets_on_clear_while_the_total_keeps_growing() {
+    let (dir, _server) = project_with_server("cost-clear", "on it");
+    agent_dir(&dir, "builder", true);
+    let rt = runtime(&dir);
+    wait_until_loaded(&rt, "builder");
+    rt.start_agent("builder").expect("start");
+
+    rt.send_agent_message("builder", "one".into())
+        .expect("send");
+    wait_until_idle(&rt, "builder");
+    let agent = rt.agent("builder").unwrap();
+    assert_eq!(agent.session_spend(), chat_spend(1));
+    assert_eq!(agent.all_sessions_spend(), chat_spend(1));
+
+    rt.send_agent_message("builder", "two".into())
+        .expect("send");
+    wait_until("the second reply", || contents(&rt, "builder").len() == 4);
+    wait_until_idle(&rt, "builder");
+    rt.clear_agent_session("builder").expect("clear");
+    wait_until("the session to clear", || {
+        rt.agent("builder").unwrap().messages().is_empty()
+    });
+
+    let agent = rt.agent("builder").unwrap();
+    assert_eq!(agent.session_spend(), Spend::default());
+    assert_eq!(agent.all_sessions_spend(), chat_spend(2));
+    assert_eq!(agent.memory_spend(), Spend::default());
+}
+
+#[test]
+fn chat_and_memory_costs_are_restored_by_the_next_process() {
+    let (dir, _server) = project_with_skills(
+        "cost-restart",
+        vec![StubReply::text("on it")],
+        writer_saves_a_skill(),
+    );
+    // two writer replies, and an embedding that came back without a cost
+    let memory = {
+        let mut memory = chat_spend(2);
+        memory.unpriced = 1;
+        memory
+    };
+    {
+        let rt = runtime(&dir);
+        rt.start_agent("builder").expect("start");
+        rt.send_agent_message("builder", "save hacker news".into())
+            .expect("send");
+        wait_until_idle(&rt, "builder");
+        rt.clear_agent_session("builder").expect("clear");
+        wait_until_job_done(&rt, "builder");
+        let agent = rt.agent("builder").unwrap();
+        assert_eq!(agent.memory_spend(), memory);
+        assert_eq!(agent.all_sessions_spend(), chat_spend(1));
+    }
+
+    let rt = runtime(&dir);
+    wait_until_loaded(&rt, "builder");
+
+    let agent = rt.agent("builder").unwrap();
+    assert_eq!(agent.session_spend(), Spend::default());
+    assert_eq!(agent.all_sessions_spend(), chat_spend(1));
+    assert_eq!(agent.memory_spend(), memory);
+    let view = agent.memory_view();
+    assert_eq!(view.skills, Some(1));
+    let last = view.last_job.expect("the job is remembered");
+    assert_eq!(last.session_id, 1);
+    assert_eq!(last.state, added_one());
+    assert_eq!(last.spend, memory);
+
+    // a new session adds to the restored total rather than replacing it
+    rt.start_agent("builder").expect("start");
+    rt.send_agent_message("builder", "again".into())
+        .expect("send");
+    wait_until_idle(&rt, "builder");
+    assert_eq!(
+        rt.agent("builder").unwrap().all_sessions_spend(),
+        chat_spend(2)
+    );
+}
+
+#[test]
+fn an_agent_without_skills_keeps_its_chat_cost_across_a_restart() {
+    let (dir, _server) = project_with_server("cost-no-skills", "on it");
+    agent_dir(&dir, "builder", true);
+    {
+        let rt = runtime(&dir);
+        rt.start_agent("builder").expect("start");
+        rt.send_agent_message("builder", "hello".into())
+            .expect("send");
+        wait_until_idle(&rt, "builder");
+    }
+
+    let rt = runtime(&dir);
+    wait_until_loaded(&rt, "builder");
+
+    let agent = rt.agent("builder").unwrap();
+    assert_eq!(agent.all_sessions_spend(), chat_spend(1));
+    assert_eq!(agent.memory_spend(), Spend::default());
+    assert_eq!(agent.memory_view().last_job, None);
+}
+
+#[test]
+fn an_agent_with_no_memory_database_starts_from_nothing() {
+    let dir = project_dir("cost-no-database");
+    let builder = agent_dir(&dir, "builder", true);
+    let rt = runtime(&dir);
+    wait_until_loaded(&rt, "builder");
+
+    let agent = rt.agent("builder").unwrap();
+    assert_eq!(agent.all_sessions_spend(), Spend::default());
+    assert_eq!(agent.memory_spend(), Spend::default());
+    let view = agent.memory_view();
+    assert_eq!(view.skills, Some(0));
+    assert_eq!(view.last_job, None);
+    assert_eq!(view.message, None);
+    // reading the totals never creates the database
+    assert!(!memory_path(&builder).exists());
+}
+
+fn added_one() -> JobState {
+    JobState::Done {
+        skills: SkillsSaved {
+            added: 1,
+            updated: 0,
+        },
+    }
 }

@@ -12,7 +12,7 @@ use turso_core::{
 };
 
 use crate::core::openrouter::client::OpenRouter;
-use crate::core::openrouter::types::{EmbeddingRequest, Message};
+use crate::core::openrouter::types::{EmbeddingRequest, Message, Spend, Usage};
 
 /// The directory inside an agent's directory that holds what it remembers.
 pub const MEMORY_DIR: &str = "memory";
@@ -25,7 +25,7 @@ pub const MAX_ATTEMPTS: i64 = 3;
 /// reported as busy and left for the next try.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(2);
 
-const SCHEMA_VERSION: &str = "1";
+const SCHEMA_VERSION: &str = "3";
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -58,6 +58,26 @@ CREATE TABLE IF NOT EXISTS memories (
   source_session INTEGER REFERENCES sessions(id),
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS session_costs (
+  session_id INTEGER PRIMARY KEY REFERENCES sessions(id),
+  tokens INTEGER NOT NULL DEFAULT 0,
+  cost_nanos INTEGER NOT NULL DEFAULT 0,
+  unpriced INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS memory_jobs (
+  id INTEGER PRIMARY KEY,
+  session_id INTEGER NOT NULL REFERENCES sessions(id),
+  owner TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('running','done','failed','interrupted')),
+  skills_saved INTEGER NOT NULL DEFAULT 0,
+  skills_updated INTEGER NOT NULL DEFAULT 0,
+  tokens INTEGER NOT NULL DEFAULT 0,
+  cost_nanos INTEGER NOT NULL DEFAULT 0,
+  unpriced INTEGER NOT NULL DEFAULT 0,
+  error TEXT,
+  started_at INTEGER NOT NULL,
+  finished_at INTEGER
 );
 ";
 
@@ -141,6 +161,65 @@ impl SessionStatus {
             SessionStatus::Ended
         }
     }
+}
+
+/// How one analysis of a session went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobStatus {
+    Running,
+    Done,
+    Failed,
+    /// Its process stopped before it finished.
+    Interrupted,
+}
+
+impl JobStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            JobStatus::Running => "running",
+            JobStatus::Done => "done",
+            JobStatus::Failed => "failed",
+            JobStatus::Interrupted => "interrupted",
+        }
+    }
+
+    fn parse(text: &str) -> Option<JobStatus> {
+        [
+            JobStatus::Running,
+            JobStatus::Done,
+            JobStatus::Failed,
+            JobStatus::Interrupted,
+        ]
+        .into_iter()
+        .find(|status| status.as_str() == text)
+    }
+}
+
+/// The skills one analysis wrote: new names, and names already stored.
+/// `added` is kept in the `skills_saved` column, its name before updates
+/// were counted apart.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SkillsSaved {
+    pub added: usize,
+    pub updated: usize,
+}
+
+impl SkillsSaved {
+    pub fn total(&self) -> usize {
+        self.added + self.updated
+    }
+}
+
+/// One analysis of a session, and what it cost.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JobRecord {
+    pub id: i64,
+    pub session_id: i64,
+    pub owner: String,
+    pub status: JobStatus,
+    pub skills: SkillsSaved,
+    pub spend: Spend,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -240,13 +319,46 @@ impl MemoryStore {
         };
         store.write(|store| {
             store.script(SCHEMA)?;
+            store.add_missing_columns()?;
             store.execute(
                 "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?1)",
                 vec![text(SCHEMA_VERSION)],
             )?;
+            // only ever raised, so a db a newer binary wrote keeps its label
+            store.execute(
+                "UPDATE meta SET value = ?1 \
+                 WHERE key = 'schema_version' AND CAST(value AS INTEGER) < ?2",
+                vec![text(SCHEMA_VERSION), integer(schema_number())],
+            )?;
             Ok(())
         })?;
         Ok(store)
+    }
+
+    /// Adds the columns a table made by an older release lacks, which
+    /// `CREATE TABLE IF NOT EXISTS` leaves alone.
+    fn add_missing_columns(&self) -> Result<(), StoreError> {
+        let columns = self
+            .rows("PRAGMA table_info(memory_jobs)", Vec::new())?
+            .iter()
+            .map(|row| text_at(row, 1))
+            .collect::<Result<Vec<_>, _>>()?;
+        if !columns.iter().any(|column| column == "skills_updated") {
+            self.execute(
+                "ALTER TABLE memory_jobs \
+                 ADD COLUMN skills_updated INTEGER NOT NULL DEFAULT 0",
+                Vec::new(),
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn schema_version(&self) -> Result<Option<String>, StoreError> {
+        let rows = self.rows(
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            Vec::new(),
+        )?;
+        rows.first().map(|row| text_at(row, 0)).transpose()
     }
 
     // Sessions //////////////////////////
@@ -272,29 +384,82 @@ impl MemoryStore {
         from_seq: usize,
         messages: &[Message],
     ) -> Result<(), StoreError> {
-        let mut encoded = Vec::with_capacity(messages.len());
-        for message in messages {
-            encoded.push(
-                serde_json::to_string(message)
-                    .map_err(|err| StoreError::Corrupt(err.to_string()))?,
-            );
-        }
-        let created_at = now();
+        let encoded = encode_messages(messages)?;
+        self.write(|store| store.insert_messages(session_id, from_seq, encoded))
+    }
+
+    /// Stores `messages` as `append_messages` does, and sets what the session
+    /// has cost so far to `spend`, in one write.
+    pub fn record(
+        &self,
+        session_id: i64,
+        from_seq: usize,
+        messages: &[Message],
+        spend: &Spend,
+    ) -> Result<(), StoreError> {
+        let encoded = encode_messages(messages)?;
         self.write(|store| {
-            for (offset, message) in encoded.into_iter().enumerate() {
-                store.execute(
-                    "INSERT OR REPLACE INTO session_messages (session_id, seq, message, created_at) \
-                     VALUES (?1, ?2, ?3, ?4)",
-                    vec![
-                        integer(session_id),
-                        integer((from_seq + offset) as i64),
-                        text(message),
-                        integer(created_at),
-                    ],
-                )?;
-            }
+            store.insert_messages(session_id, from_seq, encoded)?;
+            store.execute(
+                "INSERT INTO session_costs (session_id, tokens, cost_nanos, unpriced) \
+                 VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(session_id) DO UPDATE SET tokens = excluded.tokens, \
+                 cost_nanos = excluded.cost_nanos, unpriced = excluded.unpriced",
+                vec![
+                    integer(session_id),
+                    integer(clamp_u64(spend.tokens)),
+                    integer(spend.cost_nanos),
+                    integer(i64::from(spend.unpriced)),
+                ],
+            )?;
             Ok(())
         })
+    }
+
+    fn insert_messages(
+        &self,
+        session_id: i64,
+        from_seq: usize,
+        encoded: Vec<String>,
+    ) -> Result<(), StoreError> {
+        let created_at = now();
+        for (offset, message) in encoded.into_iter().enumerate() {
+            self.execute(
+                "INSERT OR REPLACE INTO session_messages (session_id, seq, message, created_at) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                vec![
+                    integer(session_id),
+                    integer((from_seq + offset) as i64),
+                    text(message),
+                    integer(created_at),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// What one session's chat has cost, as last recorded.
+    pub fn session_spend(&self, session_id: i64) -> Result<Option<Spend>, StoreError> {
+        let rows = self.rows(
+            "SELECT tokens, cost_nanos, unpriced FROM session_costs WHERE session_id = ?1",
+            vec![integer(session_id)],
+        )?;
+        rows.first().map(|row| spend_at(row, 0)).transpose()
+    }
+
+    /// What every session's chat but those in `exclude` has cost together.
+    pub fn session_totals(&self, exclude: &[i64]) -> Result<Spend, StoreError> {
+        let rows = self.rows(
+            "SELECT session_id, tokens, cost_nanos, unpriced FROM session_costs",
+            Vec::new(),
+        )?;
+        let mut total = Spend::default();
+        for row in &rows {
+            if !exclude.contains(&int_at(row, 0)?) {
+                total.merge(&spend_at(row, 1)?);
+            }
+        }
+        Ok(total)
     }
 
     /// Ends an active session: `pending` to be analysed, or `ended` when it
@@ -332,13 +497,19 @@ impl MemoryStore {
                     text(owner),
                 ],
             )?;
+            store.execute(
+                "UPDATE memory_jobs SET status = 'interrupted', finished_at = ?1 \
+                 WHERE owner != ?2 AND status = 'running'",
+                vec![integer(now()), text(owner)],
+            )?;
             Ok((failed + ended) as usize)
         })
     }
 
     /// Takes the oldest pending session for `owner` to analyse, counting the
-    /// attempt. Done in one write so two writers never take the same one.
-    pub fn claim_pending(&self, owner: &str) -> Result<Option<i64>, StoreError> {
+    /// attempt and opening a job for it. Done in one write so two writers
+    /// never take the same one. Returns the session's id and the job's.
+    pub fn claim_pending(&self, owner: &str) -> Result<Option<(i64, i64)>, StoreError> {
         self.write(|store| {
             let rows = store.rows(
                 "SELECT id FROM sessions WHERE status = 'pending' ORDER BY id LIMIT 1",
@@ -352,7 +523,12 @@ impl MemoryStore {
                  WHERE id = ?2",
                 vec![text(owner), integer(id)],
             )?;
-            Ok(Some(id))
+            store.execute(
+                "INSERT INTO memory_jobs (session_id, owner, status, started_at) \
+                 VALUES (?1, ?2, 'running', ?3)",
+                vec![integer(id), text(owner), integer(now())],
+            )?;
+            Ok(Some((id, store.connection.last_insert_rowid())))
         })
     }
 
@@ -368,48 +544,119 @@ impl MemoryStore {
             .unwrap_or(0) as usize)
     }
 
-    /// Records how analysing a claimed session went. A failure goes back to
-    /// `pending` until it has used up its attempts.
+    /// Sets what a running job has cost so far.
+    pub fn set_job_spend(&self, job_id: i64, spend: &Spend) -> Result<(), StoreError> {
+        self.write(|store| {
+            store.execute(
+                "UPDATE memory_jobs SET tokens = ?1, cost_nanos = ?2, unpriced = ?3 WHERE id = ?4",
+                vec![
+                    integer(clamp_u64(spend.tokens)),
+                    integer(spend.cost_nanos),
+                    integer(i64::from(spend.unpriced)),
+                    integer(job_id),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Records how analysing a claimed session went: `result` holds the
+    /// skills it saved. A failure goes back to `pending` until it has used
+    /// up its attempts.
     pub fn finish_session(
         &self,
         session_id: i64,
-        result: Result<(), String>,
+        job_id: i64,
+        result: Result<SkillsSaved, String>,
+        spend: &Spend,
     ) -> Result<SessionStatus, StoreError> {
-        self.write(|store| match &result {
-            Ok(()) => {
-                store.execute(
-                    "UPDATE sessions SET status = 'analysed', analysed_at = ?1, error = NULL \
-                     WHERE id = ?2",
-                    vec![integer(now()), integer(session_id)],
-                )?;
-                Ok(SessionStatus::Analysed)
-            }
-            Err(error) => {
-                let attempts = store
-                    .rows(
-                        "SELECT attempts FROM sessions WHERE id = ?1",
-                        vec![integer(session_id)],
-                    )?
-                    .first()
-                    .map(|row| int_at(row, 0))
-                    .transpose()?
-                    .unwrap_or(MAX_ATTEMPTS);
-                let status = if attempts >= MAX_ATTEMPTS {
-                    SessionStatus::Failed
-                } else {
-                    SessionStatus::Pending
-                };
-                store.execute(
-                    "UPDATE sessions SET status = ?1, error = ?2 WHERE id = ?3",
-                    vec![
-                        text(status.as_str()),
-                        text(error.clone()),
-                        integer(session_id),
-                    ],
-                )?;
-                Ok(status)
-            }
+        self.write(|store| {
+            let (status, job_status, saved, error) = match &result {
+                Ok(saved) => {
+                    store.execute(
+                        "UPDATE sessions SET status = 'analysed', analysed_at = ?1, error = NULL \
+                         WHERE id = ?2",
+                        vec![integer(now()), integer(session_id)],
+                    )?;
+                    (SessionStatus::Analysed, JobStatus::Done, *saved, None)
+                }
+                Err(error) => {
+                    let attempts = store
+                        .rows(
+                            "SELECT attempts FROM sessions WHERE id = ?1",
+                            vec![integer(session_id)],
+                        )?
+                        .first()
+                        .map(|row| int_at(row, 0))
+                        .transpose()?
+                        .unwrap_or(MAX_ATTEMPTS);
+                    let status = if attempts >= MAX_ATTEMPTS {
+                        SessionStatus::Failed
+                    } else {
+                        SessionStatus::Pending
+                    };
+                    store.execute(
+                        "UPDATE sessions SET status = ?1, error = ?2 WHERE id = ?3",
+                        vec![
+                            text(status.as_str()),
+                            text(error.clone()),
+                            integer(session_id),
+                        ],
+                    )?;
+                    (
+                        status,
+                        JobStatus::Failed,
+                        SkillsSaved::default(),
+                        Some(error.clone()),
+                    )
+                }
+            };
+            store.execute(
+                "UPDATE memory_jobs SET status = ?1, skills_saved = ?2, skills_updated = ?3, \
+                 tokens = ?4, cost_nanos = ?5, unpriced = ?6, error = ?7, finished_at = ?8 \
+                 WHERE id = ?9",
+                vec![
+                    text(job_status.as_str()),
+                    integer(saved.added as i64),
+                    integer(saved.updated as i64),
+                    integer(clamp_u64(spend.tokens)),
+                    integer(spend.cost_nanos),
+                    integer(i64::from(spend.unpriced)),
+                    error.map(text).unwrap_or(Value::Null),
+                    integer(now()),
+                    integer(job_id),
+                ],
+            )?;
+            Ok(status)
         })
+    }
+
+    pub fn job(&self, job_id: i64) -> Result<Option<JobRecord>, StoreError> {
+        let rows = self.rows(
+            "SELECT id, session_id, owner, status, skills_saved, skills_updated, tokens, \
+             cost_nanos, unpriced, error FROM memory_jobs WHERE id = ?1",
+            vec![integer(job_id)],
+        )?;
+        rows.first().map(|row| job_record(row)).transpose()
+    }
+
+    /// The newest job, whatever became of it.
+    pub fn last_job(&self) -> Result<Option<JobRecord>, StoreError> {
+        let rows = self.rows(
+            "SELECT id, session_id, owner, status, skills_saved, skills_updated, tokens, \
+             cost_nanos, unpriced, error FROM memory_jobs ORDER BY id DESC LIMIT 1",
+            Vec::new(),
+        )?;
+        rows.first().map(|row| job_record(row)).transpose()
+    }
+
+    /// What every job but those run by `exclude_owner` has cost together.
+    pub fn memory_totals(&self, exclude_owner: &str) -> Result<Spend, StoreError> {
+        let rows = self.rows(
+            "SELECT tokens, cost_nanos, unpriced FROM memory_jobs WHERE owner != ?1",
+            vec![text(exclude_owner)],
+        )?;
+        sum_spend(&rows)
     }
 
     pub fn session(&self, session_id: i64) -> Result<Option<SessionRecord>, StoreError> {
@@ -520,6 +767,18 @@ impl MemoryStore {
         matches.sort_by(|a, b| b.similarity.total_cmp(&a.similarity));
         matches.truncate(limit);
         Ok(matches)
+    }
+
+    pub fn count_skills(&self) -> Result<usize, StoreError> {
+        let rows = self.rows(
+            "SELECT count(*) FROM memories WHERE kind = 'skill'",
+            Vec::new(),
+        )?;
+        Ok(rows
+            .first()
+            .map(|row| int_at(row, 0))
+            .transpose()?
+            .unwrap_or(0) as usize)
     }
 
     /// How many skills were embedded some other way than `model` makes
@@ -693,6 +952,63 @@ fn session_record(row: &[Value]) -> Result<SessionRecord, StoreError> {
     })
 }
 
+fn job_record(row: &[Value]) -> Result<JobRecord, StoreError> {
+    let status = text_at(row, 3)?;
+    Ok(JobRecord {
+        id: int_at(row, 0)?,
+        session_id: int_at(row, 1)?,
+        owner: text_at(row, 2)?,
+        status: JobStatus::parse(&status)
+            .ok_or_else(|| StoreError::Corrupt(format!("unknown job status `{}`", status)))?,
+        skills: SkillsSaved {
+            added: int_at(row, 4)?.max(0) as usize,
+            updated: int_at(row, 5)?.max(0) as usize,
+        },
+        spend: spend_at(row, 6)?,
+        error: row
+            .get(9)
+            .and_then(|value| value.to_text())
+            .map(String::from),
+    })
+}
+
+/// Reads `tokens, cost_nanos, unpriced` starting at column `start`.
+fn spend_at(row: &[Value], start: usize) -> Result<Spend, StoreError> {
+    Ok(Spend::new(
+        int_at(row, start)?.max(0) as u64,
+        int_at(row, start + 1)?,
+        int_at(row, start + 2)?.clamp(0, i64::from(u32::MAX)) as u32,
+    ))
+}
+
+/// Summed here rather than in sql, where an overflowing sum is an error.
+fn sum_spend(rows: &[Vec<Value>]) -> Result<Spend, StoreError> {
+    let mut total = Spend::default();
+    for row in rows {
+        total.merge(&spend_at(row, 0)?);
+    }
+    Ok(total)
+}
+
+fn clamp_u64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn schema_number() -> i64 {
+    SCHEMA_VERSION
+        .parse()
+        .expect("the schema version is a number")
+}
+
+fn encode_messages(messages: &[Message]) -> Result<Vec<String>, StoreError> {
+    messages
+        .iter()
+        .map(|message| {
+            serde_json::to_string(message).map_err(|err| StoreError::Corrupt(err.to_string()))
+        })
+        .collect()
+}
+
 fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -746,13 +1062,26 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> Option<f64> {
 
 /// The vector `model` gives `text`.
 pub fn embed(openrouter: &OpenRouter, model: &str, text: &str) -> Result<Vec<f32>, String> {
-    let response = openrouter
-        .embeddings(EmbeddingRequest::new(model, vec![text.to_string()]))
-        .map_err(|err| err.to_string())?;
-    response
-        .data
-        .into_iter()
-        .next()
-        .map(|data| data.embedding)
-        .ok_or_else(|| "no embedding came back".to_string())
+    embed_with_usage(openrouter, model, text).0
+}
+
+/// The same vector, with what the request used. Usage comes back even when
+/// the response held no vector.
+pub fn embed_with_usage(
+    openrouter: &OpenRouter,
+    model: &str,
+    text: &str,
+) -> (Result<Vec<f32>, String>, Option<Usage>) {
+    match openrouter.embeddings(EmbeddingRequest::new(model, vec![text.to_string()])) {
+        Err(err) => (Err(err.to_string()), None),
+        Ok(response) => {
+            let embedding = response
+                .data
+                .into_iter()
+                .next()
+                .map(|data| data.embedding)
+                .ok_or_else(|| "no embedding came back".to_string());
+            (embedding, response.usage)
+        }
+    }
 }

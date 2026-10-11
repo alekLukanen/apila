@@ -1,12 +1,15 @@
+use std::path::Path;
 use std::sync::Arc;
 use std::thread;
 
-use crate::core::openrouter::types::Message;
+use turso_core::{Database, OpenFlags, OpenOptions, PlatformIO, SqliteDialect, StepResult};
+
+use crate::core::openrouter::types::{Message, Spend};
 use crate::core::test_support::scratch_dir;
 
 use super::store::{
-    cosine_similarity, decode_vector, encode_vector, memory_path, MemoryStore, NewSkill,
-    SessionStatus, MAX_ATTEMPTS,
+    cosine_similarity, decode_vector, encode_vector, memory_path, JobStatus, MemoryStore, NewSkill,
+    SessionStatus, SkillsSaved, MAX_ATTEMPTS,
 };
 
 const MODEL: &str = "openai/text-embedding-3-small";
@@ -178,7 +181,11 @@ fn a_pending_session_is_claimed_once() {
     let id = store.begin_session("owner").expect("begin");
     store.end_session(id, true).expect("end");
 
-    assert_eq!(store.claim_pending("writer").expect("claim"), Some(id));
+    let (claimed, _) = store
+        .claim_pending("writer")
+        .expect("claim")
+        .expect("a session");
+    assert_eq!(claimed, id);
     assert_eq!(store.claim_pending("writer").expect("claim"), None);
     let record = store.session(id).expect("read").expect("exists");
     assert_eq!(record.status, SessionStatus::Analysing);
@@ -207,9 +214,13 @@ fn a_session_that_keeps_failing_is_given_up_on() {
     store.end_session(id, true).expect("end");
 
     for attempt in 1..=MAX_ATTEMPTS {
-        assert_eq!(store.claim_pending("writer").expect("claim"), Some(id));
+        let (claimed, job) = store
+            .claim_pending("writer")
+            .expect("claim")
+            .expect("a session");
+        assert_eq!(claimed, id);
         let status = store
-            .finish_session(id, Err("boom".into()))
+            .finish_session(id, job, Err("boom".into()), &Spend::default())
             .expect("finish");
         let expected = if attempt < MAX_ATTEMPTS {
             SessionStatus::Pending
@@ -234,7 +245,13 @@ fn an_interrupted_analysis_is_retried_by_the_next_process() {
     store.recover("new", true).expect("recover");
     assert_eq!(status(&store, id), SessionStatus::Pending);
 
-    store.finish_session(id, Ok(())).expect("finish");
+    let (_, job) = store
+        .claim_pending("new")
+        .expect("claim")
+        .expect("a session");
+    store
+        .finish_session(id, job, Ok(SkillsSaved::default()), &Spend::default())
+        .expect("finish");
     assert_eq!(status(&store, id), SessionStatus::Analysed);
 }
 
@@ -268,4 +285,345 @@ fn two_connections_can_write_at_the_same_time() {
 
     assert_eq!(first.sessions().expect("sessions").len(), 50);
     assert_eq!(first.list_skills(100).expect("skills").len(), 50);
+}
+
+// Costs /////////////////////////////
+//////////////////////////////////////
+
+/// The schema as the first release wrote it, before costs were kept.
+const SCHEMA_V1: &str = "
+CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE sessions (
+  id INTEGER PRIMARY KEY,
+  owner TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('active','ended','pending','analysing','analysed','failed')),
+  started_at INTEGER NOT NULL,
+  ended_at INTEGER,
+  analysed_at INTEGER,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  error TEXT
+);
+CREATE TABLE session_messages (
+  session_id INTEGER NOT NULL REFERENCES sessions(id),
+  seq INTEGER NOT NULL,
+  message TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (session_id, seq)
+);
+CREATE TABLE memories (
+  id INTEGER PRIMARY KEY,
+  kind TEXT NOT NULL CHECK (kind IN ('skill')),
+  name TEXT NOT NULL UNIQUE,
+  when_to_use TEXT NOT NULL,
+  body TEXT NOT NULL,
+  embedding BLOB NOT NULL,
+  embedding_model TEXT NOT NULL,
+  dimensions INTEGER NOT NULL,
+  source_session INTEGER REFERENCES sessions(id),
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+INSERT INTO meta (key, value) VALUES ('schema_version', '1');
+INSERT INTO sessions (owner, status, started_at) VALUES ('old', 'ended', 0);
+";
+
+/// The tables the second release added, before updated skills were counted
+/// apart, with one finished job.
+const SCHEMA_V2_ADDITIONS: &str = "
+CREATE TABLE session_costs (
+  session_id INTEGER PRIMARY KEY REFERENCES sessions(id),
+  tokens INTEGER NOT NULL DEFAULT 0,
+  cost_nanos INTEGER NOT NULL DEFAULT 0,
+  unpriced INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE memory_jobs (
+  id INTEGER PRIMARY KEY,
+  session_id INTEGER NOT NULL REFERENCES sessions(id),
+  owner TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('running','done','failed','interrupted')),
+  skills_saved INTEGER NOT NULL DEFAULT 0,
+  tokens INTEGER NOT NULL DEFAULT 0,
+  cost_nanos INTEGER NOT NULL DEFAULT 0,
+  unpriced INTEGER NOT NULL DEFAULT 0,
+  error TEXT,
+  started_at INTEGER NOT NULL,
+  finished_at INTEGER
+);
+UPDATE meta SET value = '2' WHERE key = 'schema_version';
+INSERT INTO memory_jobs (session_id, owner, status, skills_saved, tokens, started_at)
+  VALUES (1, 'old', 'done', 2, 40, 0);
+";
+
+/// Writes a database the way an older release did, without going through
+/// the store, which would upgrade it.
+fn write_old_database(path: &Path, script: &str) {
+    std::fs::create_dir_all(path.parent().expect("a parent")).expect("create dir");
+    let io = Arc::new(PlatformIO::new().expect("io"));
+    let database = Database::open(
+        io,
+        path.to_str().expect("utf-8"),
+        OpenOptions::new(Arc::new(SqliteDialect)).flags(OpenFlags::Create),
+    )
+    .expect("open");
+    let connection = database.connect().expect("connect");
+    let mut rest = script;
+    while let Some((mut statement, end)) = connection.consume_stmt(rest).expect("parse") {
+        loop {
+            match statement.step().expect("step") {
+                StepResult::Done => break,
+                StepResult::IO | StepResult::Yield => statement._io().step().expect("io"),
+                StepResult::Row => {}
+                other => panic!("unexpected step result: {:?}", other),
+            }
+        }
+        rest = &rest[end..];
+    }
+}
+
+#[test]
+fn a_first_release_database_is_upgraded_in_place() {
+    let path = memory_path(&scratch_dir());
+    write_old_database(&path, SCHEMA_V1);
+
+    let store = MemoryStore::open_existing(&path)
+        .expect("open")
+        .expect("exists");
+
+    assert_eq!(
+        store.schema_version().expect("version").as_deref(),
+        Some("3")
+    );
+    assert_eq!(store.sessions().expect("sessions").len(), 1);
+    assert_eq!(store.session_totals(&[]).expect("totals"), Spend::default());
+    assert_eq!(store.memory_totals("me").expect("totals"), Spend::default());
+    assert_eq!(store.last_job().expect("last job"), None);
+    // a session an older binary began takes a cost all the same
+    store
+        .record(1, 0, &[Message::user("hi")], &Spend::new(5, 7, 0))
+        .expect("record");
+    assert_eq!(
+        store.session_spend(1).expect("spend"),
+        Some(Spend::new(5, 7, 0))
+    );
+}
+
+#[test]
+fn a_second_release_job_table_gains_the_updated_count() {
+    let path = memory_path(&scratch_dir());
+    write_old_database(&path, &format!("{}{}", SCHEMA_V1, SCHEMA_V2_ADDITIONS));
+
+    let store = MemoryStore::open_existing(&path)
+        .expect("open")
+        .expect("exists");
+
+    assert_eq!(
+        store.schema_version().expect("version").as_deref(),
+        Some("3")
+    );
+    // what the older release counted as saved is read back as added
+    let old = store.last_job().expect("last job").expect("a job");
+    assert_eq!(
+        old.skills,
+        SkillsSaved {
+            added: 2,
+            updated: 0
+        }
+    );
+    assert_eq!(old.spend, Spend::new(40, 0, 0));
+
+    let session = store.begin_session("me").expect("begin");
+    store.end_session(session, true).expect("end");
+    let (id, job) = store
+        .claim_pending("me")
+        .expect("claim")
+        .expect("a session");
+    let skills = SkillsSaved {
+        added: 0,
+        updated: 3,
+    };
+    store
+        .finish_session(id, job, Ok(skills), &Spend::default())
+        .expect("finish");
+    assert_eq!(store.last_job().unwrap().unwrap().skills, skills);
+    drop(store);
+
+    // opening it again leaves the column it already has
+    let again = MemoryStore::open_existing(&path)
+        .expect("open again")
+        .expect("exists");
+    assert_eq!(again.last_job().unwrap().unwrap().skills, skills);
+}
+
+#[test]
+fn recording_stores_the_total_so_far_rather_than_adding_to_it() {
+    let store = store();
+    let id = store.begin_session("owner").expect("begin");
+
+    store
+        .record(id, 0, &[Message::user("one")], &Spend::new(10, 100, 0))
+        .expect("record");
+    store
+        .record(id, 1, &[Message::assistant("two")], &Spend::new(30, 250, 1))
+        .expect("record");
+    // the cost alone, with no new messages
+    store
+        .record(id, 2, &[], &Spend::new(40, 300, 1))
+        .expect("record");
+
+    assert_eq!(
+        store.session_spend(id).expect("spend"),
+        Some(Spend::new(40, 300, 1))
+    );
+    assert_eq!(store.session_messages(id).expect("messages").len(), 2);
+
+    let other = store.begin_session("owner").expect("begin");
+    store
+        .record(other, 0, &[Message::user("x")], &Spend::new(1, 2, 0))
+        .expect("record");
+    assert_eq!(
+        store.session_totals(&[]).expect("totals"),
+        Spend::new(41, 302, 1)
+    );
+    assert_eq!(
+        store.session_totals(&[id]).expect("totals"),
+        Spend::new(1, 2, 0)
+    );
+}
+
+#[test]
+fn a_job_records_what_its_analysis_cost() {
+    let store = store();
+    let id = store.begin_session("owner").expect("begin");
+    store.end_session(id, true).expect("end");
+
+    let (claimed, job) = store
+        .claim_pending("writer")
+        .expect("claim")
+        .expect("a session");
+    assert_eq!(claimed, id);
+    let running = store.last_job().expect("last job").expect("a job");
+    assert_eq!(running.status, JobStatus::Running);
+    assert_eq!(running.session_id, id);
+    assert_eq!(running.owner, "writer");
+
+    store
+        .set_job_spend(job, &Spend::new(10, 20, 0))
+        .expect("spend");
+    assert_eq!(
+        store.last_job().expect("last job").expect("a job").spend,
+        Spend::new(10, 20, 0)
+    );
+
+    store
+        .finish_session(
+            id,
+            job,
+            Ok(SkillsSaved {
+                added: 2,
+                updated: 1,
+            }),
+            &Spend::new(15, 35, 1),
+        )
+        .expect("finish");
+    let done = store.last_job().expect("last job").expect("a job");
+    assert_eq!(done.status, JobStatus::Done);
+    assert_eq!(
+        done.skills,
+        SkillsSaved {
+            added: 2,
+            updated: 1
+        }
+    );
+    assert_eq!(done.spend, Spend::new(15, 35, 1));
+    assert_eq!(done.error, None);
+}
+
+#[test]
+fn a_failed_job_keeps_its_error_and_cost() {
+    let store = store();
+    let id = store.begin_session("owner").expect("begin");
+    store.end_session(id, true).expect("end");
+    let (_, job) = store
+        .claim_pending("writer")
+        .expect("claim")
+        .expect("a session");
+
+    store
+        .finish_session(id, job, Err("boom".into()), &Spend::new(3, 4, 0))
+        .expect("finish");
+
+    let failed = store.last_job().expect("last job").expect("a job");
+    assert_eq!(failed.status, JobStatus::Failed);
+    assert_eq!(failed.error.as_deref(), Some("boom"));
+    assert_eq!(failed.spend, Spend::new(3, 4, 0));
+}
+
+#[test]
+fn memory_totals_leave_out_one_owners_jobs_and_last_job_is_the_newest() {
+    let store = store();
+    for owner in ["old", "this", "old"] {
+        let id = store.begin_session("owner").expect("begin");
+        store.end_session(id, true).expect("end");
+        let (_, job) = store
+            .claim_pending(owner)
+            .expect("claim")
+            .expect("a session");
+        store
+            .finish_session(id, job, Ok(SkillsSaved::default()), &Spend::new(1, 10, 0))
+            .expect("finish");
+    }
+
+    assert_eq!(
+        store.memory_totals("this").expect("totals"),
+        Spend::new(2, 20, 0)
+    );
+    assert_eq!(
+        store.memory_totals("nobody").expect("totals"),
+        Spend::new(3, 30, 0)
+    );
+    let last = store.last_job().expect("last job").expect("a job");
+    assert_eq!(last.owner, "old");
+    assert_eq!(last.session_id, 3);
+}
+
+#[test]
+fn recovery_marks_other_processes_running_jobs_interrupted_and_keeps_their_cost() {
+    let store = store();
+    let mut jobs = Vec::new();
+    for owner in ["old", "this"] {
+        let id = store.begin_session(owner).expect("begin");
+        store.end_session(id, true).expect("end");
+        let (_, job) = store
+            .claim_pending(owner)
+            .expect("claim")
+            .expect("a session");
+        store
+            .set_job_spend(job, &Spend::new(5, 50, 0))
+            .expect("spend");
+        jobs.push(job);
+    }
+
+    store.recover("this", true).expect("recover");
+
+    let status = |job: i64| store.job(job).expect("read").expect("exists").status;
+    assert_eq!(status(jobs[0]), JobStatus::Interrupted);
+    assert_eq!(status(jobs[1]), JobStatus::Running);
+    assert_eq!(
+        store.memory_totals("this").expect("totals"),
+        Spend::new(5, 50, 0)
+    );
+}
+
+#[test]
+fn skills_are_counted() {
+    let store = store();
+    assert_eq!(store.count_skills().expect("count"), 0);
+
+    store.upsert_skill(&skill("one", vec![1.0])).expect("save");
+    assert_eq!(store.count_skills().expect("count"), 1);
+
+    store
+        .upsert_skill(&skill("one", vec![0.5]))
+        .expect("save again");
+    assert_eq!(store.count_skills().expect("count"), 1);
 }

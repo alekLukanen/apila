@@ -1,15 +1,16 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::core::openrouter::client::{OpenRouter, OpenRouterConfig};
-use crate::core::openrouter::types::{FunctionCall, Message, ToolCall};
+use crate::core::openrouter::types::{FunctionCall, Message, Spend, ToolCall};
 use crate::core::runtime::agent_config::SkillsSettings;
-use crate::core::test_support::{scratch_dir, Route, StubOpenRouter, StubReply};
+use crate::core::test_support::{scratch_dir, Route, StubOpenRouter, StubReply, STUB_CHAT_TOKENS};
 use crate::core::tools::tool::{Tool, ToolContext, ToolError};
 
-use super::recorder::MemoryStatus;
-use super::store::{memory_path, MemoryStore, SessionStatus, SkillSummary};
+use super::recorder::{JobState, MemoryStatus};
+use super::store::{
+    memory_path, JobStatus, MemoryStore, NewSkill, SessionStatus, SkillSummary, SkillsSaved,
+};
 use super::writer::{
     head_and_tail, process, render_transcript, skill_writer_prompt, writer_input, AgentJob,
     SaveSkillTool, MAX_SKILLS_PER_SESSION, MAX_TOOL_RESULT_BYTES,
@@ -245,7 +246,21 @@ fn a_pending_session_is_turned_into_a_skill() {
     let skills = store.list_skills(10).expect("skills");
     assert_eq!(skills.len(), 1);
     assert_eq!(skills[0].name, "fetch-webpage-into-sqlite");
-    assert_eq!(job.status.get().as_deref(), Some("saved 1 skill"));
+    let view = job.status.snapshot();
+    assert_eq!(view.message, None);
+    assert_eq!(view.skills, Some(1));
+    assert_eq!(view.pending, Some(0));
+    let last = view.last_job.expect("a job");
+    assert_eq!(last.session_id, id);
+    assert_eq!(
+        last.state,
+        JobState::Done {
+            skills: SkillsSaved {
+                added: 1,
+                updated: 0
+            }
+        }
+    );
 
     // the writer saw the transcript, and embedded the name and when_to_use
     let chat = server.chat_requests(WRITER_MODEL);
@@ -258,6 +273,52 @@ fn a_pending_session_is_turned_into_a_skill() {
     );
     // the second request answered the save with its result
     assert!(chat[1].contains("saved skill `fetch-webpage-into-sqlite` (id 1, new)"));
+}
+
+#[test]
+fn a_session_that_updates_one_skill_and_adds_another_counts_them_apart() {
+    let (dir, id) = agent_with_pending_session();
+    open(&dir)
+        .upsert_skill(&NewSkill {
+            name: "fetch-webpage-into-sqlite".into(),
+            when_to_use: "earlier".into(),
+            body: "earlier".into(),
+            embedding: vec![1.0, 0.0],
+            embedding_model: EMBEDDING_MODEL.into(),
+            source_session: None,
+        })
+        .expect("an earlier skill");
+    let server = StubOpenRouter::start_routed(vec![
+        (
+            Route::Chat(WRITER_MODEL.into()),
+            vec![
+                save_skill_call("call-1", "fetch-webpage-into-sqlite"),
+                save_skill_call("call-2", "query-sqlite"),
+                StubReply::tool_call("call-3", "end_turn", serde_json::json!({})),
+            ],
+        ),
+        (
+            Route::Embeddings,
+            vec![StubReply::embedding(vec![1.0, 0.0])],
+        ),
+    ]);
+    let job = job(&dir, Some(skills(4)));
+
+    process(&job, &openrouter(&server), OWNER).expect("process");
+
+    let expected = SkillsSaved {
+        added: 1,
+        updated: 1,
+    };
+    let view = job.status.snapshot();
+    assert_eq!(view.skills, Some(2));
+    assert_eq!(
+        view.last_job.expect("a job").state,
+        JobState::Done { skills: expected }
+    );
+    let row = open(&dir).last_job().expect("read").expect("a job");
+    assert_eq!(row.session_id, id);
+    assert_eq!(row.skills, expected);
 }
 
 #[test]
@@ -366,7 +427,7 @@ fn save_skill_refuses_bad_arguments_and_too_many_saves() {
         Route::Embeddings,
         vec![StubReply::embedding(vec![1.0, 0.0])],
     )]);
-    let saved = Arc::new(AtomicUsize::new(0));
+    let saved = Arc::new(Mutex::new(SkillsSaved::default()));
     let tool = SaveSkillTool::new(EMBEDDING_MODEL.into(), 1, Arc::clone(&saved));
     let context = ToolContext::new(dir, serde_json::json!({}))
         .set_memory(Some(store))
@@ -382,12 +443,172 @@ fn save_skill_refuses_bad_arguments_and_too_many_saves() {
             .expect_err("a long body");
     assert!(matches!(err, ToolError::InvalidArgument { ref argument, .. } if argument == "body"));
 
-    for index in 0..MAX_SKILLS_PER_SESSION {
+    // an update counts towards the cap as much as a new skill does
+    save(serde_json::json!({"name": "s0", "when_to_use": "w", "body": "b"})).expect("save");
+    save(serde_json::json!({"name": "s0", "when_to_use": "w", "body": "b2"})).expect("update");
+    for index in 2..MAX_SKILLS_PER_SESSION {
         save(serde_json::json!({"name": format!("s{}", index), "when_to_use": "w", "body": "b"}))
             .expect("save");
     }
     let err = save(serde_json::json!({"name": "one-more", "when_to_use": "w", "body": "b"}))
         .expect_err("too many");
     assert!(matches!(err, ToolError::Rejected { .. }), "{err:?}");
-    assert_eq!(saved.load(Ordering::SeqCst), MAX_SKILLS_PER_SESSION);
+    assert_eq!(
+        *saved.lock().unwrap(),
+        SkillsSaved {
+            added: MAX_SKILLS_PER_SESSION - 1,
+            updated: 1
+        }
+    );
+}
+
+// Costs /////////////////////////////
+//////////////////////////////////////
+
+/// What one scripted chat reply costs, in nanodollars.
+const CHAT_NANOS: i64 = 100_000;
+const EMBEDDING_TOKENS: u32 = 5;
+const EMBEDDING_NANOS: i64 = 20_000;
+
+fn costed_embedding() -> StubReply {
+    StubReply::embedding_with_cost(vec![1.0, 0.0], EMBEDDING_TOKENS, 0.00002)
+}
+
+#[test]
+fn a_finished_job_records_its_chat_and_embedding_cost() {
+    let (dir, id) = agent_with_pending_session();
+    let server = StubOpenRouter::start_routed(vec![
+        (
+            Route::Chat(WRITER_MODEL.into()),
+            vec![
+                save_skill_call("call-1", "fetch-webpage-into-sqlite"),
+                StubReply::tool_call("call-2", "end_turn", serde_json::json!({})),
+            ],
+        ),
+        (Route::Embeddings, vec![costed_embedding()]),
+    ]);
+    let job = job(&dir, Some(skills(4)));
+
+    process(&job, &openrouter(&server), OWNER).expect("process");
+
+    let expected = Spend::new(
+        2 * STUB_CHAT_TOKENS + u64::from(EMBEDDING_TOKENS),
+        2 * CHAT_NANOS + EMBEDDING_NANOS,
+        0,
+    );
+    let store = open(&dir);
+    let row = store.last_job().expect("read").expect("a job");
+    assert_eq!(row.session_id, id);
+    assert_eq!(row.status, JobStatus::Done);
+    assert_eq!(
+        row.skills,
+        SkillsSaved {
+            added: 1,
+            updated: 0
+        }
+    );
+    assert_eq!(row.spend, expected);
+    assert_eq!(store.memory_totals("nobody").expect("totals"), expected);
+
+    let view = job.status.snapshot();
+    assert_eq!(view.last_job.expect("a job").spend, expected);
+    assert_eq!(view.jobs_live, expected);
+}
+
+#[test]
+fn a_failed_job_keeps_what_it_spent_and_its_session_stays_pending() {
+    let (dir, id) = agent_with_pending_session();
+    let server = StubOpenRouter::start_routed(vec![
+        (
+            Route::Chat(WRITER_MODEL.into()),
+            vec![
+                save_skill_call("call-1", "fetch-webpage-into-sqlite"),
+                // not a completion, so the second request fails
+                StubReply::json(serde_json::json!({"nope": true})),
+            ],
+        ),
+        (Route::Embeddings, vec![costed_embedding()]),
+    ]);
+    let job = job(&dir, Some(skills(4)));
+
+    process(&job, &openrouter(&server), OWNER).expect_err("the analysis fails");
+
+    let expected = Spend::new(
+        STUB_CHAT_TOKENS + u64::from(EMBEDDING_TOKENS),
+        CHAT_NANOS + EMBEDDING_NANOS,
+        0,
+    );
+    let row = open(&dir).last_job().expect("read").expect("a job");
+    assert_eq!(row.status, JobStatus::Failed);
+    assert_eq!(row.spend, expected);
+    assert!(row.error.is_some());
+
+    let view = job.status.snapshot();
+    assert_eq!(view.pending, Some(1));
+    assert!(view.stalled());
+    let last = view.last_job.expect("a job");
+    assert_eq!(last.session_id, id);
+    assert!(matches!(last.state, JobState::Failed(_)));
+    assert_eq!(last.spend, expected);
+}
+
+#[test]
+fn a_retried_session_counts_each_attempt() {
+    let (dir, id) = agent_with_pending_session();
+    let failing = StubOpenRouter::start_routed(vec![(
+        Route::Chat(WRITER_MODEL.into()),
+        vec![
+            StubReply::tool_call("call-1", "nope", serde_json::json!({})),
+            StubReply::json(serde_json::json!({"nope": true})),
+        ],
+    )]);
+    let job = job(&dir, Some(skills(4)));
+    process(&job, &openrouter(&failing), OWNER).expect_err("the first attempt fails");
+
+    let working = StubOpenRouter::start_routed(vec![(
+        Route::Chat(WRITER_MODEL.into()),
+        vec![StubReply::tool_call(
+            "call-1",
+            "end_turn",
+            serde_json::json!({}),
+        )],
+    )]);
+    process(&job, &openrouter(&working), OWNER).expect("the retry works");
+
+    let store = open(&dir);
+    let first = store.job(1).expect("read").expect("the first attempt");
+    let second = store.job(2).expect("read").expect("the retry");
+    assert_eq!((first.session_id, second.session_id), (id, id));
+    assert_eq!(first.status, JobStatus::Failed);
+    assert_eq!(second.status, JobStatus::Done);
+    let expected = Spend::new(2 * STUB_CHAT_TOKENS, 2 * CHAT_NANOS, 0);
+    assert_eq!(store.memory_totals("nobody").expect("totals"), expected);
+    assert_eq!(job.status.snapshot().jobs_live, expected);
+    assert_eq!(job.status.snapshot().pending, Some(0));
+}
+
+#[test]
+fn save_skill_hands_its_embedding_cost_to_the_writer() {
+    let dir = scratch_dir();
+    let store = Arc::new(MemoryStore::create(&memory_path(&dir)).expect("create"));
+    let server = StubOpenRouter::start_routed(vec![(Route::Embeddings, vec![costed_embedding()])]);
+    let spend = Arc::new(std::sync::Mutex::new(Spend::default()));
+    let tool =
+        SaveSkillTool::new(EMBEDDING_MODEL.into(), 1, Arc::default()).set_spend(Arc::clone(&spend));
+    let context = ToolContext::new(dir, serde_json::json!({}))
+        .set_memory(Some(store))
+        .set_openrouter(Some(openrouter(&server)));
+    let mut state = tool.new_state(&context).expect("start");
+
+    state
+        .run(
+            &context,
+            &serde_json::json!({"name": "x", "when_to_use": "w", "body": "b"}),
+        )
+        .expect("save");
+
+    assert_eq!(
+        *spend.lock().unwrap(),
+        Spend::new(u64::from(EMBEDDING_TOKENS), EMBEDDING_NANOS, 0)
+    );
 }

@@ -28,6 +28,12 @@ pub const TEST_EMBEDDING_MODEL: &str = "openai/text-embedding-3-small";
 /// The model the skill writer runs on in tests, set apart from the agent's.
 pub const TEST_WRITER_MODEL: &str = "anthropic/claude-haiku-4.5";
 
+/// What every scripted chat reply says it cost, exact in nanodollars.
+pub const STUB_CHAT_COST: f64 = 0.0001;
+
+/// The tokens every scripted chat reply says it used.
+pub const STUB_CHAT_TOKENS: u64 = 18;
+
 /// How long a test waits on an agent's background request before giving up.
 const WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -97,6 +103,19 @@ impl StubReply {
         }
     }
 
+    /// An embeddings response holding one vector, with what it used and cost.
+    pub fn embedding_with_cost(vector: Vec<f32>, tokens: u32, cost: f64) -> StubReply {
+        StubReply {
+            body: serde_json::json!({
+                "object": "list",
+                "model": "stub-embedding",
+                "data": [{"object": "embedding", "index": 0, "embedding": vector}],
+                "usage": {"prompt_tokens": tokens, "total_tokens": tokens, "cost": cost},
+            })
+            .to_string(),
+        }
+    }
+
     fn from_choice(message: serde_json::Value, finish_reason: &str) -> StubReply {
         StubReply {
             body: serde_json::json!({
@@ -108,7 +127,12 @@ impl StubReply {
                     "message": message,
                     "finish_reason": finish_reason,
                 }],
-                "usage": {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18},
+                "usage": {
+                    "prompt_tokens": 11,
+                    "completion_tokens": 7,
+                    "total_tokens": STUB_CHAT_TOKENS,
+                    "cost": STUB_CHAT_COST,
+                },
             })
             .to_string(),
         }
