@@ -3,7 +3,7 @@ use std::{fs, path::Path, time::Duration};
 use crate::core::config::config::Config;
 use crate::core::memory::recorder::JobState;
 use crate::core::memory::store::{
-    memory_path, MemoryStore, SessionRecord, SessionStatus, SkillsSaved,
+    memory_path, MemoryStore, NewSkill, SessionRecord, SessionStatus, SkillsSaved,
 };
 use crate::core::openrouter::types::{Message, Spend};
 use crate::core::runtime::agent::AgentState;
@@ -1909,4 +1909,90 @@ fn added_one() -> JobState {
             updated: 0,
         },
     }
+}
+
+// Viewing memories //////////////////
+//////////////////////////////////////
+
+/// Saves skills straight into an agent's memory database, as an earlier
+/// process would have. Returns their ids.
+fn seed_skills(agent_dir: &Path, names: &[&str]) -> Vec<i64> {
+    let store = MemoryStore::create(&memory_path(agent_dir)).expect("create the memory");
+    names
+        .iter()
+        .map(|name| {
+            store
+                .upsert_skill(&NewSkill {
+                    name: name.to_string(),
+                    when_to_use: format!("when {} is needed", name),
+                    body: format!("## Steps\n{}", name),
+                    embedding: vec![1.0, 0.0],
+                    embedding_model: "test-embedding".into(),
+                    source_session: None,
+                })
+                .expect("save a skill")
+                .0
+        })
+        .collect()
+}
+
+#[test]
+fn an_agent_that_never_started_lists_its_skills() {
+    let dir = project_dir("skills-list");
+    let builder = agent_dir(&dir, "builder", true);
+    seed_skills(&builder, &["fetch", "parse"]);
+    let rt = runtime(&dir);
+
+    let skills = rt.agent_skills("builder").expect("list skills");
+    let names: Vec<&str> = skills.iter().map(|skill| skill.name.as_str()).collect();
+    assert_eq!(names, vec!["parse", "fetch"]);
+    assert_eq!(skills[1].body, "## Steps\nfetch");
+    assert!(!rt.agent("builder").unwrap().state().started());
+}
+
+#[test]
+fn deleting_a_skill_recounts_the_agents_skills() {
+    let dir = project_dir("skills-delete");
+    let builder = agent_dir(&dir, "builder", true);
+    let ids = seed_skills(&builder, &["fetch", "parse"]);
+    let rt = runtime(&dir);
+    wait_until_loaded(&rt, "builder");
+    assert_eq!(rt.agent("builder").unwrap().memory_view().skills, Some(2));
+
+    assert!(rt.delete_agent_skill("builder", ids[0]).expect("delete"));
+    assert!(!rt
+        .delete_agent_skill("builder", ids[0])
+        .expect("delete again"));
+
+    assert_eq!(rt.agent("builder").unwrap().memory_view().skills, Some(1));
+    let skills = rt.agent_skills("builder").expect("list skills");
+    assert_eq!(skills.len(), 1);
+    assert_eq!(skills[0].name, "parse");
+}
+
+#[test]
+fn an_agent_with_no_memory_database_has_no_skills_to_list() {
+    let dir = project_dir("skills-none");
+    let builder = agent_dir(&dir, "builder", true);
+    let rt = runtime(&dir);
+
+    assert!(rt.agent_skills("builder").expect("list skills").is_empty());
+    assert!(!rt.delete_agent_skill("builder", 1).expect("delete"));
+    // looking never creates the database
+    assert!(!memory_path(&builder).exists());
+}
+
+#[test]
+fn skills_of_an_unknown_agent_are_refused() {
+    let dir = project_dir("skills-unknown");
+    let rt = runtime(&dir);
+
+    assert!(matches!(
+        rt.agent_skills("nobody"),
+        Err(RuntimeError::UnknownAgent(id)) if id == "nobody"
+    ));
+    assert!(matches!(
+        rt.delete_agent_skill("nobody", 1),
+        Err(RuntimeError::UnknownAgent(_))
+    ));
 }

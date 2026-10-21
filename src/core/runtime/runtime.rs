@@ -8,7 +8,8 @@ use std::{
 use thiserror::Error;
 
 use crate::core::config::config::Config;
-use crate::core::memory::store::memory_path;
+use crate::core::memory::recorder::MemoryStatus;
+use crate::core::memory::store::{memory_path, MemoryStore, SkillListing, StoreError};
 use crate::core::memory::writer::{process_token, AgentJob, MemoryWriter};
 use crate::core::openrouter::client::{OpenRouter, OpenRouterConfig, OpenRouterError};
 use crate::core::runtime::agent::{Agent, AgentDefinition, AgentError, ClearOutcome};
@@ -37,6 +38,9 @@ pub enum RuntimeError {
 
     #[error("openrouter error: {0}")]
     OpenRouter(#[from] OpenRouterError),
+
+    #[error("memory error: {0}")]
+    Memory(#[from] StoreError),
 }
 
 /// An agent's `config.json` is required, so every way of failing to read it
@@ -351,6 +355,41 @@ impl Runtime {
             AgentError::NotStarted => RuntimeError::AgentNotStarted(id.to_string()),
             err => err.into(),
         })
+    }
+
+    /// Every skill in the agent's memory database, newest first. Works whether
+    /// or not the agent has started; no database means no skills.
+    pub fn agent_skills(&self, id: &str) -> Result<Vec<SkillListing>, RuntimeError> {
+        match self.agent_store(id)? {
+            Some((store, _)) => Ok(store.skills()?),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Permanently deletes one of the agent's skills and recounts them for the
+    /// ui. False when it was already gone.
+    pub fn delete_agent_skill(&self, id: &str, skill_id: i64) -> Result<bool, RuntimeError> {
+        let Some((store, status)) = self.agent_store(id)? else {
+            return Ok(false);
+        };
+        let deleted = store.delete_skill(skill_id)?;
+        status.set_skills(store.count_skills()?);
+        Ok(deleted)
+    }
+
+    /// The agent's memory database, if it has one. Read under the lock, which
+    /// is let go before the database is opened.
+    fn agent_store(&self, id: &str) -> Result<Option<(MemoryStore, MemoryStatus)>, RuntimeError> {
+        let (dir, status) = {
+            let inner = self.inner.lock().expect("mutex error");
+            let definition = inner.agent(id)?.agent_definition();
+            (definition.config().dir(), definition.memory_status_handle())
+        };
+        // an unset directory would otherwise resolve against the working one
+        if dir.as_os_str().is_empty() {
+            return Ok(None);
+        }
+        Ok(MemoryStore::open_existing(&memory_path(&dir))?.map(|store| (store, status)))
     }
 
     /// The directories in the project directory an agent is loaded from.

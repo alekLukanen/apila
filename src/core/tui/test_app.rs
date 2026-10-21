@@ -1,12 +1,14 @@
 use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::{backend::TestBackend, layout::Position, Terminal};
+use turso_core::{Database, OpenFlags, OpenOptions, PlatformIO, SqliteDialect, StepResult};
 
 use crate::core::memory::recorder::{JobState, MemoryJob, MemoryView};
-use crate::core::memory::store::SkillsSaved;
+use crate::core::memory::store::{memory_path, MemoryStore, NewSkill, SkillsSaved};
 use crate::core::openrouter::types::{Message, Spend};
-use std::time::Duration;
 
 use crate::core::test_support::{
     agent_dir, project_dir, project_with_delayed_server, project_with_routes, project_with_server,
@@ -87,6 +89,11 @@ fn every_detail_screen_renders() {
     assert!(screen.contains("directive"));
     assert!(!screen.contains("you"));
     assert!(screen.contains("a half typed reply"));
+
+    // the memories of an agent with no memory database yet
+    press(&mut app, KeyCode::Tab);
+    term.draw(|frame| app.draw(frame)).expect("draw memories");
+    assert!(format!("{}", term.backend()).contains("No memories yet."));
 }
 
 #[test]
@@ -1062,4 +1069,355 @@ fn an_agent_without_skills_says_skills_are_off() {
         "{shown}"
     );
     assert!(!shown.contains("Last job:"), "{shown}");
+}
+
+// Viewing memories //////////////////
+//////////////////////////////////////
+
+const SKILL_BODY: &str = "## Steps\n1. fetch the page\n2. save it";
+
+fn save_skill(agent_dir: &Path, name: &str, body: &str) -> i64 {
+    let store = MemoryStore::create(&memory_path(agent_dir)).expect("create the memory");
+    store
+        .upsert_skill(&NewSkill {
+            name: name.into(),
+            when_to_use: format!("when {} is needed", name),
+            body: body.into(),
+            embedding: vec![1.0, 0.0],
+            embedding_model: "test-embedding".into(),
+            source_session: None,
+        })
+        .expect("save a skill")
+        .0
+}
+
+fn skill_count(agent_dir: &Path) -> usize {
+    MemoryStore::open_existing(&memory_path(agent_dir))
+        .expect("open the memory")
+        .expect("the memory exists")
+        .count_skills()
+        .expect("count skills")
+}
+
+/// A project whose one agent has skills on and `skills` saved, drawn once
+/// its skill count has been read.
+fn with_skills(
+    test: &str,
+    skills: &[(&str, &str)],
+) -> (Terminal<TestBackend>, TUIApp, std::path::PathBuf) {
+    let dir = project_dir(test);
+    let builder = agent_dir(&dir, "builder", true);
+    write_agent_config_with_skills(
+        &builder,
+        TEST_MODEL,
+        TEST_WRITER_MODEL,
+        serde_json::json!({"enabled": []}),
+    );
+    for (name, body) in skills {
+        save_skill(&builder, name, body);
+    }
+    let mut term = Terminal::new(TestBackend::new(120, 40)).expect("terminal");
+    let mut app = app(&dir);
+    let expected = format!("Memories ({})", skills.len());
+    wait_until("the skill count", || {
+        screen(&mut term, &mut app).contains(&expected)
+    });
+    (term, app, builder)
+}
+
+#[test]
+fn the_tab_bar_names_both_tabs_and_tab_shows_the_memories() {
+    let (mut term, mut app, _) = with_skills("app-tabs", &[("fetch-page", SKILL_BODY)]);
+    let shown = screen(&mut term, &mut app);
+    assert!(shown.contains("Setup │ Memories (1)"), "{shown}");
+    assert!(shown.contains("Memories <Tab>"), "{shown}");
+
+    press(&mut app, KeyCode::Tab);
+    let shown = screen(&mut term, &mut app);
+    assert!(shown.contains("fetch-page"), "{shown}");
+    assert!(shown.contains("when fetch-page is needed"), "{shown}");
+    assert!(shown.contains("Updated "), "{shown}");
+    assert!(shown.contains("Steps"), "{shown}");
+    assert!(shown.contains("1. fetch the page"), "{shown}");
+    assert!(!shown.contains("## Steps"), "{shown}");
+    assert!(shown.contains("Session <Tab>"), "{shown}");
+
+    // and back again
+    press(&mut app, KeyCode::Tab);
+    let shown = screen(&mut term, &mut app);
+    assert!(shown.contains("Configuration files:"), "{shown}");
+}
+
+#[test]
+fn enter_on_the_memories_tab_browses_rather_than_starting_the_agent() {
+    let (mut term, mut app, _) = with_skills("app-tab-enter", &[("fetch-page", SKILL_BODY)]);
+    press(&mut app, KeyCode::Tab);
+    let shown = screen(&mut term, &mut app);
+    assert!(shown.contains("Browse Memories <Enter>"), "{shown}");
+
+    press(&mut app, KeyCode::Enter);
+    let shown = screen(&mut term, &mut app);
+    assert!(shown.contains("State:     configuring"), "{shown}");
+    assert!(shown.contains("Delete <D>"), "{shown}");
+    assert!(shown.contains("Back <Esc>"), "{shown}");
+
+    // Esc goes back to the list, still on the memories
+    press(&mut app, KeyCode::Esc);
+    let shown = screen(&mut term, &mut app);
+    assert!(shown.contains("Browse Memories <Enter>"), "{shown}");
+    assert!(shown.contains("fetch-page"), "{shown}");
+}
+
+#[test]
+fn tab_from_the_chat_keeps_the_draft_and_types_nothing() {
+    let (mut term, mut app, _server) = composing("app-tab-draft");
+    type_text(&mut app, "half typed");
+    let shown = screen(&mut term, &mut app);
+    assert!(shown.contains("Memories <Tab>"), "{shown}");
+
+    press(&mut app, KeyCode::Tab);
+    let shown = screen(&mut term, &mut app);
+    assert!(shown.contains("No memories yet."), "{shown}");
+    assert!(shown.contains("Session <Tab>"), "{shown}");
+
+    press(&mut app, KeyCode::Tab);
+    type_text(&mut app, "!");
+    let shown = screen(&mut term, &mut app);
+    assert!(shown.contains("half typed!"), "{shown}");
+}
+
+#[test]
+fn a_delete_is_cancelled_by_any_key_but_y() {
+    let (mut term, mut app, builder) = with_skills(
+        "app-delete",
+        &[("fetch-page", SKILL_BODY), ("parse-feed", "parse it")],
+    );
+    press(&mut app, KeyCode::Tab);
+    press(&mut app, KeyCode::Enter);
+
+    // the newest skill is listed first and selected
+    press(&mut app, KeyCode::Char('d'));
+    let shown = screen(&mut term, &mut app);
+    assert!(
+        shown.contains("Delete skill `parse-feed`? <y> to delete, any other key cancels"),
+        "{shown}"
+    );
+
+    press(&mut app, KeyCode::Char('x'));
+    let shown = screen(&mut term, &mut app);
+    assert!(!shown.contains("Delete skill"), "{shown}");
+    assert!(shown.contains("parse-feed"), "{shown}");
+    assert_eq!(skill_count(&builder), 2);
+
+    press(&mut app, KeyCode::Char('d'));
+    press(&mut app, KeyCode::Char('y'));
+    let shown = screen(&mut term, &mut app);
+    assert!(shown.contains("deleted skill `parse-feed`"), "{shown}");
+    assert!(!shown.contains("parse-feed "), "{shown}");
+    assert!(shown.contains("fetch-page"), "{shown}");
+    assert!(shown.contains("Memory:    1 skill"), "{shown}");
+    assert!(shown.contains("Memories (1)"), "{shown}");
+    assert_eq!(skill_count(&builder), 1);
+}
+
+#[test]
+fn confirming_a_skill_deleted_meanwhile_says_it_was_already_gone() {
+    let (mut term, mut app, builder) = with_skills(
+        "app-delete-gone",
+        &[("fetch-page", SKILL_BODY), ("parse-feed", "parse it")],
+    );
+    press(&mut app, KeyCode::Tab);
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Char('d'));
+
+    // another connection deletes it while the prompt is up
+    let store = MemoryStore::open_existing(&memory_path(&builder))
+        .expect("open the memory")
+        .expect("the memory exists");
+    let id = store
+        .skills()
+        .expect("list skills")
+        .into_iter()
+        .find(|skill| skill.name == "parse-feed")
+        .expect("the skill")
+        .id;
+    assert!(store.delete_skill(id).expect("delete"));
+    drop(store);
+
+    press(&mut app, KeyCode::Char('y'));
+    let shown = screen(&mut term, &mut app);
+    assert!(
+        shown.contains("skill `parse-feed` was already gone"),
+        "{shown}"
+    );
+    assert!(!shown.contains("deleted skill"), "{shown}");
+    assert!(!shown.contains("parse-feed "), "{shown}");
+    assert!(shown.contains("fetch-page"), "{shown}");
+    assert!(shown.contains("Memories (1)"), "{shown}");
+    assert_eq!(skill_count(&builder), 1);
+}
+
+fn long_body() -> String {
+    (1..=60)
+        .map(|n| format!("- body line {}", n))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn page_down_while_a_delete_is_armed_cancels_it_rather_than_scrolling() {
+    let (mut term, mut app, builder) = with_skills("app-delete-page", &[("long", &long_body())]);
+    press(&mut app, KeyCode::Tab);
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Char('d'));
+
+    press(&mut app, KeyCode::PageDown);
+    let shown = screen(&mut term, &mut app);
+    assert!(!shown.contains("Delete skill"), "{shown}");
+    assert!(shown.contains("Updated "), "{shown}");
+    assert_eq!(skill_count(&builder), 1);
+
+    press(&mut app, KeyCode::PageDown);
+    let shown = screen(&mut term, &mut app);
+    assert!(!shown.contains("Updated "), "{shown}");
+    assert!(shown.contains("PgDn or scroll down"), "{shown}");
+}
+
+#[test]
+fn the_wheel_scrolls_the_reader_but_not_from_the_list() {
+    let (mut term, mut app, _) = with_skills("app-memory-wheel", &[("long", &long_body())]);
+    press(&mut app, KeyCode::Tab);
+    screen(&mut term, &mut app);
+    let over_list = find(&term, "just now").expect("the list row");
+    let over_reader = find(&term, "body line 5").expect("the reader");
+
+    mouse(&mut app, MouseEventKind::ScrollDown, over_list);
+    assert!(screen(&mut term, &mut app).contains("Updated "));
+
+    mouse(&mut app, MouseEventKind::ScrollDown, over_reader);
+    let shown = screen(&mut term, &mut app);
+    assert!(!shown.contains("Updated "), "{shown}");
+
+    mouse(&mut app, MouseEventKind::ScrollUp, over_reader);
+    assert!(screen(&mut term, &mut app).contains("Updated "));
+}
+
+/// Holds a write transaction on the memory database until dropped.
+struct WriteLock {
+    connection: Arc<turso_core::Connection>,
+    _database: Arc<Database>,
+}
+
+impl WriteLock {
+    fn take(path: &Path) -> WriteLock {
+        let io = Arc::new(PlatformIO::new().expect("io"));
+        let database = Database::open(
+            io,
+            path.to_str().expect("utf-8"),
+            OpenOptions::new(Arc::new(SqliteDialect)).flags(OpenFlags::None),
+        )
+        .expect("open");
+        let connection = database.connect().expect("connect");
+        let lock = WriteLock {
+            connection,
+            _database: database,
+        };
+        lock.run("BEGIN IMMEDIATE");
+        lock
+    }
+
+    fn run(&self, sql: &str) {
+        let mut statement = self.connection.prepare(sql).expect("prepare");
+        loop {
+            match statement.step().expect("step") {
+                StepResult::Done => break,
+                StepResult::IO | StepResult::Yield => statement._io().step().expect("io"),
+                other => panic!("unexpected step result: {:?}", other),
+            }
+        }
+    }
+}
+
+impl Drop for WriteLock {
+    fn drop(&mut self) {
+        self.run("ROLLBACK");
+    }
+}
+
+#[test]
+fn a_delete_that_cannot_get_the_database_keeps_the_skill_and_says_why() {
+    let (mut term, mut app, builder) =
+        with_skills("app-delete-busy", &[("fetch-page", SKILL_BODY)]);
+    press(&mut app, KeyCode::Tab);
+    press(&mut app, KeyCode::Enter);
+    screen(&mut term, &mut app);
+
+    let lock = WriteLock::take(&memory_path(&builder));
+    press(&mut app, KeyCode::Char('d'));
+    press(&mut app, KeyCode::Char('y'));
+    let shown = screen(&mut term, &mut app);
+    drop(lock);
+
+    assert!(shown.contains("memory error"), "{shown}");
+    assert!(!shown.contains("deleted skill"), "{shown}");
+    assert!(shown.contains("fetch-page"), "{shown}");
+    assert_eq!(skill_count(&builder), 1);
+}
+
+#[test]
+fn a_job_that_only_updates_a_skill_reloads_the_reader() {
+    const NAME: &str = "fetch-webpage-into-sqlite";
+    let (dir, _server) = project_with_routes(
+        "app-memory-update",
+        vec![
+            (
+                Route::Chat(TEST_MODEL.into()),
+                vec![StubReply::text("on it")],
+            ),
+            (
+                Route::Chat(TEST_WRITER_MODEL.into()),
+                vec![
+                    StubReply::tool_call(
+                        "w1",
+                        "save_skill",
+                        serde_json::json!({
+                            "name": NAME,
+                            "when_to_use": "The user asks to save a web page.",
+                            "body": "## Steps\n1. the newer way",
+                        }),
+                    ),
+                    StubReply::tool_call("w2", "end_turn", serde_json::json!({})),
+                ],
+            ),
+            (
+                Route::Embeddings,
+                vec![StubReply::embedding(vec![1.0, 0.0])],
+            ),
+        ],
+    );
+    let builder = agent_dir(&dir, "builder", true);
+    write_agent_config_with_skills(
+        &builder,
+        TEST_MODEL,
+        TEST_WRITER_MODEL,
+        serde_json::json!({"enabled": []}),
+    );
+    save_skill(&builder, NAME, "## Steps\n1. the older way");
+    let mut term = Terminal::new(TestBackend::new(120, 40)).expect("terminal");
+    let mut app = app(&dir);
+
+    press(&mut app, KeyCode::Enter);
+    type_line(&mut app, "save hacker news");
+    wait_until("the reply", || {
+        screen(&mut term, &mut app).contains("State:     idle")
+    });
+    type_line(&mut app, "/clear");
+    // the view is read now, most likely before the job has saved anything
+    press(&mut app, KeyCode::Tab);
+    wait_until("the updated body", || {
+        screen(&mut term, &mut app).contains("the newer way")
+    });
+    let shown = screen(&mut term, &mut app);
+    assert!(shown.contains("Memories (1)"), "{shown}");
+    assert!(!shown.contains("the older way"), "{shown}");
 }

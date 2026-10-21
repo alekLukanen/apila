@@ -149,6 +149,24 @@ for, and `—` one where none had a cost. The `all` and `mem` totals are kept in
 the agent's `memory/memory.db`, so deleting that file resets them. The
 embeddings `search_skills` makes are not counted.
 
+#### Viewing memories
+
+Under the configuration, the detail window has two tabs: `Setup` (or `Session`
+once the agent runs) and `Memories (N)`. `<Tab>` switches between them from the
+agent list, steps from the chat into the memories, and goes back again with the
+chat's draft kept. The tab you pick stays put as you move between agents, and
+it works for any agent with a `memory/memory.db`, whether it has started or
+not and whether skills are on.
+
+On the Memories tab, `<Enter>` browses the skills without starting the agent.
+The list shows each skill's name, `when_to_use` and how long ago it was
+updated; the reader beside it shows the updated time in local time and the
+skill's body rendered as markdown. `↑/↓` pick a skill, `<PgUp/PgDn>` and the
+wheel over the reader scroll it, `<R>` reloads and `<Esc>` goes back to the
+list. `<D>` then `y` deletes the selected skill permanently; any other key
+cancels. The writer may save a deleted skill again if a later session teaches
+it the same thing.
+
 ## Tools
 
 | tool | enabled by | settings |

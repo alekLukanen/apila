@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use turso_core::{Database, OpenFlags, OpenOptions, PlatformIO, SqliteDialect, StepResult};
 
@@ -9,7 +10,7 @@ use crate::core::test_support::scratch_dir;
 
 use super::store::{
     cosine_similarity, decode_vector, encode_vector, memory_path, JobStatus, MemoryStore, NewSkill,
-    SessionStatus, SkillsSaved, MAX_ATTEMPTS,
+    SessionStatus, SkillsSaved, LISTED_BODY_CHARS, MAX_ATTEMPTS,
 };
 
 const MODEL: &str = "openai/text-embedding-3-small";
@@ -626,4 +627,74 @@ fn skills_are_counted() {
         .upsert_skill(&skill("one", vec![0.5]))
         .expect("save again");
     assert_eq!(store.count_skills().expect("count"), 1);
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_secs() as i64
+}
+
+#[test]
+fn every_skill_is_listed_with_its_body_newest_first() {
+    let store = store();
+    store.upsert_skill(&skill("old", vec![1.0])).expect("save");
+    store.upsert_skill(&skill("new", vec![1.0])).expect("save");
+
+    let skills = store.skills().expect("list");
+    // saved in the same second, so the later id comes first
+    let names: Vec<&str> = skills.iter().map(|skill| skill.name.as_str()).collect();
+    assert_eq!(names, vec!["new", "old"]);
+    assert_eq!(skills[1].body, "## Steps\nold");
+    assert_eq!(skills[1].when_to_use, "when old is needed");
+    let first_saved = skills[1].updated_at;
+    assert!(first_saved > 0);
+
+    // the next second, saving it again moves it to the top
+    while unix_now() <= first_saved {
+        thread::sleep(Duration::from_millis(20));
+    }
+    store
+        .upsert_skill(&skill("old", vec![0.5]))
+        .expect("save again");
+    let skills = store.skills().expect("list");
+    assert_eq!(skills[0].name, "old");
+    assert!(skills[0].updated_at > first_saved);
+}
+
+#[test]
+fn a_listed_body_is_cut_short() {
+    let store = store();
+    let mut long = skill("long", vec![1.0]);
+    long.body = "x".repeat(LISTED_BODY_CHARS * 2);
+    store.upsert_skill(&long).expect("save");
+
+    let skills = store.skills().expect("list");
+    assert_eq!(skills[0].body.chars().count(), LISTED_BODY_CHARS);
+}
+
+#[test]
+fn a_deleted_skill_is_gone_and_can_be_saved_again() {
+    let store = store();
+    let (id, _) = store
+        .upsert_skill(&skill("fetch", vec![1.0, 0.0]))
+        .expect("save");
+    store
+        .upsert_skill(&skill("other", vec![0.0, 1.0]))
+        .expect("save");
+
+    assert!(store.delete_skill(id).expect("delete"));
+    assert!(!store.delete_skill(id).expect("delete again"));
+    assert_eq!(store.count_skills().expect("count"), 1);
+    assert!(store.get(id).expect("get").is_none());
+    let found = store.search(&[1.0, 0.0], MODEL, 0.9, 10).expect("search");
+    assert!(found.iter().all(|skill| skill.name != "fetch"), "{found:?}");
+
+    let (again, created) = store
+        .upsert_skill(&skill("fetch", vec![1.0, 0.0]))
+        .expect("save again");
+    assert!(created);
+    assert_ne!(again, id);
+    assert_eq!(store.count_skills().expect("count"), 2);
 }

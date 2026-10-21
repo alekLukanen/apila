@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::{
@@ -9,7 +9,9 @@ use ratatui::{
     style::{Color, Style, Stylize},
     symbols::border,
     text::{Line, Span, Text},
-    widgets::{Block, Cell, HighlightSpacing, Padding, Paragraph, Row, Table, TableState, Wrap},
+    widgets::{
+        Block, Cell, HighlightSpacing, Padding, Paragraph, Row, Table, TableState, Tabs, Wrap,
+    },
     DefaultTerminal, Frame,
 };
 use thiserror::Error;
@@ -24,6 +26,7 @@ use crate::core::runtime::agent::{AgentDefinition, AgentState, ClearOutcome};
 use crate::core::runtime::{agent_config, runtime};
 
 use super::chat_input::{ChatInput, INPUT_MAX_ROWS};
+use super::memories::{self, reload_stamp, MemoriesView, PendingDelete, ReaderView};
 use super::scroll::{self, ChatScroll, WHEEL_LINES};
 
 /// How long the ui waits for a key before redrawing. Agents answer on
@@ -83,11 +86,20 @@ pub enum TUIAppError {
 }
 
 /// Where key presses go. The agent list drives everything until the user
-/// steps into an agent's chat.
+/// steps into an agent's chat or its memories.
 #[derive(Debug, PartialEq)]
 enum Focus {
     Agents,
     Chat,
+    Memories,
+}
+
+/// What the detail window shows under the agent's configuration. Kept when
+/// another agent is selected.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum DetailTab {
+    Session,
+    Memories,
 }
 
 /// Where the selected agent's chat was last drawn, so the wheel and paging keys
@@ -114,8 +126,14 @@ pub struct TUIApp {
     chat_scroll: HashMap<String, ChatScroll>,
     /// Set while drawing a chat session, and cleared before every redraw.
     chat_view: Option<ChatView>,
-    /// True while typing into the selected agent's chat box.
+    /// True while typing into the selected agent's chat box. Kept while in
+    /// the memories, so `<Tab>` can go back to the chat.
     chat_focused: bool,
+    detail_tab: DetailTab,
+    /// True while browsing the selected agent's memories.
+    memories_focused: bool,
+    /// The selected agent's skills, while the Memories tab is showing.
+    memories: Option<MemoriesView>,
     /// Shown along the bottom of the detail window until the next key press.
     status_message: Option<String>,
     /// The same, for news that is not an error.
@@ -157,6 +175,9 @@ impl TUIApp {
             chat_scroll: HashMap::new(),
             chat_view: None,
             chat_focused: false,
+            detail_tab: DetailTab::Session,
+            memories_focused: false,
+            memories: None,
             status_message: None,
             info_message: None,
             exit: false,
@@ -229,20 +250,45 @@ impl TUIApp {
             return Ok(());
         }
 
-        // the transcript scrolls whichever window has focus
+        // whatever is pressed next answers an armed delete, so nothing else
+        // runs on the key that cancels one
+        if let Some(pending) = self
+            .memories
+            .as_mut()
+            .and_then(|view| view.take_confirmed())
+        {
+            let plain = !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+            if key.code == KeyCode::Char('y') && plain {
+                self.delete_skill(pending);
+            }
+            return Ok(());
+        }
+
+        // the transcript or the open memory scrolls whichever window has focus
         let page = match key.code {
             KeyCode::PageUp => Some(-1),
             KeyCode::PageDown => Some(1),
             _ => None,
         };
         if let Some(direction) = page {
-            self.page_chat(direction);
+            match self.detail_tab {
+                DetailTab::Session => self.page_chat(direction),
+                DetailTab::Memories => self.page_memories(direction),
+            }
+            return Ok(());
+        }
+
+        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            self.switch_tab();
             return Ok(());
         }
 
         match self.focus() {
             Focus::Agents => self.handle_agents_key(key),
             Focus::Chat => self.handle_chat_key(key),
+            Focus::Memories => self.handle_memories_key(key),
         }
     }
 
@@ -251,11 +297,150 @@ impl TUIApp {
             KeyCode::Char('q') => self.exit = true,
             KeyCode::Down | KeyCode::Char('j') => self.select_agent_offset(1),
             KeyCode::Up | KeyCode::Char('k') => self.select_agent_offset(-1),
-            KeyCode::Char('r') => self.reload_agents(),
-            KeyCode::Enter | KeyCode::Char('i') => self.open_selected_agent(),
+            KeyCode::Char('r') => {
+                self.reload_agents();
+                if self.detail_tab == DetailTab::Memories {
+                    self.load_memories();
+                }
+            }
+            KeyCode::Enter | KeyCode::Char('i') => match self.detail_tab {
+                // browsing an agent's memories never starts it
+                DetailTab::Memories => self.memories_focused = self.selected_agent().is_some(),
+                DetailTab::Session => self.open_selected_agent(),
+            },
             _ => {}
         }
         Ok(())
+    }
+
+    /// From the list it flips the tab; from the chat it steps into the
+    /// memories; from the memories it goes back to wherever it came from.
+    fn switch_tab(&mut self) {
+        match self.focus() {
+            Focus::Agents => {
+                self.detail_tab = match self.detail_tab {
+                    DetailTab::Session => DetailTab::Memories,
+                    DetailTab::Memories => DetailTab::Session,
+                };
+            }
+            Focus::Chat => {
+                self.detail_tab = DetailTab::Memories;
+                self.memories_focused = true;
+            }
+            Focus::Memories => {
+                self.detail_tab = DetailTab::Session;
+                self.memories_focused = false;
+            }
+        }
+        self.refresh_memories();
+    }
+
+    fn handle_memories_key(&mut self, key: KeyEvent) -> Result<(), TUIAppError> {
+        match key.code {
+            KeyCode::Esc => {
+                self.memories_focused = false;
+                self.chat_focused = false;
+            }
+            KeyCode::Down | KeyCode::Char('j') => self.select_memory_offset(1),
+            KeyCode::Up | KeyCode::Char('k') => self.select_memory_offset(-1),
+            KeyCode::Char('r') => self.load_memories(),
+            KeyCode::Char('d') => {
+                if let Some(view) = self.memories.as_mut() {
+                    view.arm_delete();
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn select_memory_offset(&mut self, offset: isize) {
+        if let Some(view) = self.memories.as_mut() {
+            view.select_offset(offset);
+        }
+    }
+
+    fn delete_skill(&mut self, pending: PendingDelete) {
+        match self
+            .rt
+            .delete_agent_skill(&pending.agent_id, pending.skill_id)
+        {
+            Ok(deleted) => {
+                self.info_message = Some(if deleted {
+                    format!("deleted skill `{}`", pending.name)
+                } else {
+                    format!("skill `{}` was already gone", pending.name)
+                });
+                self.load_memories();
+            }
+            Err(err) => self.status_message = Some(err.to_string()),
+        }
+    }
+
+    /// Reads the selected agent's skills again, keeping the selection when
+    /// the view was already showing that agent.
+    fn load_memories(&mut self) {
+        let Some(definition) = self.selected_agent() else {
+            self.memories = None;
+            return;
+        };
+        let id = definition.id();
+        let stamp = reload_stamp(&definition.memory_view());
+        // a failed read keeps what is on screen and is not retried every frame
+        let skills = match self.rt.agent_skills(&id) {
+            Ok(skills) => Some(skills),
+            Err(err) => {
+                self.status_message = Some(err.to_string());
+                None
+            }
+        };
+        match &mut self.memories {
+            Some(view) if view.agent_id() == id => {
+                let skills = skills.unwrap_or_else(|| view.skills().to_vec());
+                view.reload(skills, stamp);
+            }
+            _ => {
+                self.memories = Some(MemoriesView::new(id, skills.unwrap_or_default(), stamp));
+            }
+        }
+    }
+
+    /// Called before every draw. The database is only read when the tab is
+    /// first shown, the agent changes, or the writer has saved since.
+    fn refresh_memories(&mut self) {
+        if self.detail_tab != DetailTab::Memories {
+            self.memories = None;
+            return;
+        }
+        let Some(definition) = self.selected_agent() else {
+            self.memories = None;
+            self.memories_focused = false;
+            return;
+        };
+        let stale = match &self.memories {
+            Some(view) => {
+                view.agent_id() != definition.id()
+                    || view.needs_reload(&reload_stamp(&definition.memory_view()))
+            }
+            None => true,
+        };
+        if stale {
+            self.load_memories();
+        }
+    }
+
+    /// The memories view, if it is the selected agent's.
+    fn selected_memories(&mut self) -> Option<&mut MemoriesView> {
+        let id = self.selected_agent_id()?;
+        self.memories.as_mut().filter(|view| view.agent_id() == id)
+    }
+
+    fn page_memories(&mut self, direction: isize) {
+        if let Some(view) = self.selected_memories() {
+            if let Some(reader) = view.reader() {
+                view.scroll_by(direction * scroll::page_lines(reader.height) as isize);
+            }
+        }
     }
 
     /// `<Enter>` on an agent runs it the first time and steps into its chat
@@ -355,13 +540,19 @@ impl TUIApp {
             MouseEventKind::ScrollDown => WHEEL_LINES as isize,
             _ => return,
         };
+        let at = Position::new(mouse.column, mouse.row);
+        if self.detail_tab == DetailTab::Memories {
+            if let Some(view) = self.selected_memories() {
+                if view.reader().is_some_and(|reader| reader.area.contains(at)) {
+                    view.scroll_by(delta);
+                }
+            }
+            return;
+        }
         let Some(view) = self.selected_chat_view() else {
             return;
         };
-        if view
-            .transcript_area
-            .contains(Position::new(mouse.column, mouse.row))
-        {
+        if view.transcript_area.contains(at) {
             self.scroll_chat(&view, delta);
         }
     }
@@ -449,9 +640,11 @@ impl TUIApp {
     }
 
     fn focus(&self) -> Focus {
-        let started = self
-            .selected_agent()
-            .is_some_and(|agent| agent.state().started());
+        let selected = self.selected_agent();
+        if self.memories_focused && self.detail_tab == DetailTab::Memories && selected.is_some() {
+            return Focus::Memories;
+        }
+        let started = selected.is_some_and(|agent| agent.state().started());
         if self.chat_focused && started {
             Focus::Chat
         } else {
@@ -463,7 +656,12 @@ impl TUIApp {
     //////////////////////////////////////
 
     pub fn draw(&mut self, frame: &mut Frame) {
-        let instructions = Line::from(Self::instruction_spans(self.focus(), self.enter_label()));
+        self.refresh_memories();
+        let instructions = Line::from(Self::instruction_spans(
+            self.focus(),
+            self.enter_label(),
+            self.detail_tab,
+        ));
         let block = Block::default()
             .padding(Padding::top(1))
             .title_bottom(instructions.centered());
@@ -490,6 +688,9 @@ impl TUIApp {
 
     /// What `<Enter>` does to the selected agent, for the key hints.
     fn enter_label(&self) -> &'static str {
+        if self.detail_tab == DetailTab::Memories {
+            return "Browse Memories";
+        }
         let Some(definition) = self.selected_agent() else {
             return "Run Agent";
         };
@@ -505,12 +706,21 @@ impl TUIApp {
 
     /// The key hints along the bottom, which follow whatever has focus.
     /// `enter_label` says what `<Enter>` does to the selected agent.
-    fn instruction_spans(focus: Focus, enter_label: &'static str) -> Vec<Span<'static>> {
+    fn instruction_spans(
+        focus: Focus,
+        enter_label: &'static str,
+        tab: DetailTab,
+    ) -> Vec<Span<'static>> {
+        let other_tab = match tab {
+            DetailTab::Session => "Memories",
+            DetailTab::Memories => "Session",
+        };
         let pairs: Vec<(&str, &str)> = match focus {
             Focus::Agents => vec![
                 ("Quit", " <Q>"),
                 ("Move", " <↑/↓>"),
                 (enter_label, " <Enter>"),
+                (other_tab, " <Tab>"),
                 ("Reload", " <R>"),
             ],
             Focus::Chat => vec![
@@ -518,7 +728,17 @@ impl TUIApp {
                 ("Newline", " <Alt+Enter>"),
                 ("Scroll", " <PgUp/PgDn>"),
                 ("New Session", " /clear"),
+                ("Memories", " <Tab>"),
                 ("Leave Chat", " <Esc>"),
+                ("Quit", " <Ctrl+C>"),
+            ],
+            Focus::Memories => vec![
+                ("Move", " <↑/↓>"),
+                ("Scroll", " <PgUp/PgDn>"),
+                ("Delete", " <D>"),
+                ("Reload", " <R>"),
+                ("Session", " <Tab>"),
+                ("Back", " <Esc>"),
                 ("Quit", " <Ctrl+C>"),
             ],
         };
@@ -612,17 +832,22 @@ impl TUIApp {
             .collect();
 
         // create and render table
-        let table = Table::new(rows, [Constraint::Fill(1)])
-            .column_spacing(1)
-            // subtle slate wash so the cyan row text stays readable
-            .row_highlight_style(Style::default().bg(Color::Rgb(45, 55, 72)))
-            .highlight_symbol(Text::from(vec![">".bold().cyan().into()]))
-            .highlight_spacing(HighlightSpacing::Always);
+        let table = Self::selection_table(rows);
 
         frame.render_widget(block, area);
         frame.render_stateful_widget(table, table_area, &mut self.agents_table_state);
 
         Ok(())
+    }
+
+    /// A one column list whose selected row is marked and highlighted.
+    fn selection_table(rows: Vec<Row<'_>>) -> Table<'_> {
+        Table::new(rows, [Constraint::Fill(1)])
+            .column_spacing(1)
+            // subtle slate wash so the cyan row text stays readable
+            .row_highlight_style(Style::default().bg(Color::Rgb(45, 55, 72)))
+            .highlight_symbol(Text::from(vec![">".bold().cyan().into()]))
+            .highlight_spacing(HighlightSpacing::Always)
     }
 
     /// The color the status dot takes for each agent state.
@@ -855,7 +1080,15 @@ impl TUIApp {
             return Ok(());
         };
 
-        let status_height = if self.status_message.is_some() || self.info_message.is_some() {
+        let confirm_delete = self
+            .memories
+            .as_ref()
+            .and_then(|view| view.confirm_delete())
+            .cloned();
+        let status_height = if confirm_delete.is_some()
+            || self.status_message.is_some()
+            || self.info_message.is_some()
+        {
             2
         } else {
             0
@@ -863,22 +1096,37 @@ impl TUIApp {
         let config_lines = self.config_lines(&definition);
         let layout = Layout::vertical([
             Constraint::Length(config_lines.len() as u16 + 1),
+            Constraint::Length(1),
             Constraint::Fill(1),
             Constraint::Length(status_height),
         ]);
-        let [config_area, body_area, status_area] = layout.areas(inner);
+        let [config_area, tab_area, body_area, status_area] = layout.areas(inner);
 
         // render top info area
         frame.render_widget(Paragraph::new(config_lines), config_area);
+        self.render_tabs(&definition, tab_area, frame);
 
-        // render configuration or session
-        match definition.state() {
-            AgentState::Configuring => self.render_configuring(&definition, body_area, frame),
+        // render configuration, session or memories
+        match (self.detail_tab, definition.state()) {
+            (DetailTab::Memories, _) => self.render_memories(body_area, frame),
+            (_, AgentState::Configuring) => self.render_configuring(&definition, body_area, frame),
             _ => self.render_session(&definition, body_area, frame),
         }
 
         // render status message
-        if let Some(status) = &self.status_message {
+        if let Some(pending) = confirm_delete {
+            frame.render_widget(
+                Paragraph::new(
+                    Line::from(format!(
+                        "Delete skill `{}`? <y> to delete, any other key cancels",
+                        pending.name
+                    ))
+                    .yellow(),
+                )
+                .wrap(Wrap::default()),
+                status_area,
+            );
+        } else if let Some(status) = &self.status_message {
             frame.render_widget(
                 Paragraph::new(Line::from(status.clone()).red()).wrap(Wrap::default()),
                 status_area,
@@ -891,6 +1139,117 @@ impl TUIApp {
         }
 
         Ok(())
+    }
+
+    /// `Setup` or `Session`, then `Memories (N)`. The tab showing is underlined
+    /// while its window has focus.
+    fn render_tabs(&self, definition: &AgentDefinition, area: Rect, frame: &mut Frame) {
+        let first = match definition.state() {
+            AgentState::Configuring => "Setup".to_string(),
+            _ => "Session".to_string(),
+        };
+        let memories = match definition.memory_view().skills {
+            Some(count) => format!("Memories ({})", count),
+            None => "Memories".to_string(),
+        };
+        let focus = self.focus();
+        let (selected, focused) = match self.detail_tab {
+            DetailTab::Session => (0, focus == Focus::Chat),
+            DetailTab::Memories => (1, focus == Focus::Memories),
+        };
+        let mut highlight = Style::default().bold().cyan();
+        if focused {
+            highlight = highlight.underlined();
+        }
+        let tabs = Tabs::new(vec![first, memories])
+            .select(selected)
+            .style(Style::default().dark_gray())
+            .highlight_style(highlight);
+        frame.render_widget(tabs, area);
+    }
+
+    /// The selected agent's skills on the left and the open one on the right.
+    fn render_memories(&mut self, area: Rect, frame: &mut Frame) {
+        let focused = self.focus() == Focus::Memories;
+        let Some(view) = self.memories.as_mut() else {
+            frame.render_widget(Paragraph::new(Line::from("Loading…").dark_gray()), area);
+            return;
+        };
+        if view.skills().is_empty() {
+            view.set_reader(None);
+            let hint = Paragraph::new(vec![
+                Line::from("No memories yet.").dark_gray(),
+                Line::from(""),
+                Line::from(
+                    "Skills the memory writer saves from this agent's sessions show up here.",
+                )
+                .dark_gray(),
+            ])
+            .wrap(Wrap::default());
+            frame.render_widget(hint, area);
+            return;
+        }
+
+        let [list_area, reader_area] =
+            Layout::horizontal([Constraint::Percentage(35), Constraint::Percentage(65)])
+                .areas(area);
+        let border = if focused {
+            Style::default().cyan()
+        } else {
+            Style::default().dark_gray()
+        };
+
+        let list_block = Block::bordered()
+            .title(" Skills ")
+            .border_set(border::ROUNDED)
+            .border_style(border);
+        let table_area = list_block.inner(list_area);
+        // the highlight symbol and the column spacing sit to the left of the cell
+        let row_width = table_area.width.saturating_sub(2) as usize;
+        let rows: Vec<Row> = memories::list_rows(view.skills(), row_width, unix_now())
+            .into_iter()
+            .map(|lines| Row::new(vec![Cell::from(Vec::from(lines))]).height(2))
+            .collect();
+        let table = Self::selection_table(rows);
+        frame.render_widget(list_block, list_area);
+        frame.render_stateful_widget(table, table_area, &mut view.table_state);
+
+        let title = view
+            .selected()
+            .map(|skill| {
+                let room = (reader_area.width as usize).saturating_sub(4);
+                format!(" {} ", memories::fit_width(&skill.name, room))
+            })
+            .unwrap_or_default();
+        let reader_block = Block::bordered()
+            .title(Line::from(title).bold().cyan())
+            .border_set(border::ROUNDED)
+            .border_style(border);
+        let inner = reader_block.inner(reader_area);
+        frame.render_widget(reader_block, reader_area);
+
+        let height = inner.height as usize;
+        let top = view.top();
+        let lines = view.reader_lines(inner.width as usize);
+        let total = lines.len();
+        let max_top = total.saturating_sub(height);
+        let top = top.min(max_top);
+        let mut shown: Vec<Line> = lines.iter().skip(top).take(height).cloned().collect();
+        if top < max_top && height >= 2 {
+            shown.pop();
+            let hidden = total - (top + shown.len());
+            shown.push(
+                Line::from(format!("↓ {} more lines — PgDn or scroll down", hidden))
+                    .dark_gray()
+                    .italic(),
+            );
+        }
+        frame.render_widget(Paragraph::new(shown), inner);
+        view.set_reader(Some(ReaderView {
+            area: reader_area,
+            max_top,
+            height,
+        }));
     }
 
     /// The agent's configuration, shown above whatever the detail window is
@@ -1365,6 +1724,13 @@ impl TUIApp {
         }
         out
     }
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn plural(count: usize, noun: &str) -> String {

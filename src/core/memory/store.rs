@@ -18,6 +18,9 @@ use crate::core::openrouter::types::{EmbeddingRequest, Message, Spend, Usage};
 pub const MEMORY_DIR: &str = "memory";
 pub const MEMORY_FILE: &str = "memory.db";
 
+/// The most of a skill's body [`MemoryStore::skills`] reads.
+pub const LISTED_BODY_CHARS: usize = 16 * 1024;
+
 /// How many times a session is analysed before it is given up on.
 pub const MAX_ATTEMPTS: i64 = 3;
 
@@ -255,6 +258,19 @@ pub struct SkillSummary {
     pub id: i64,
     pub name: String,
     pub when_to_use: String,
+}
+
+/// A skill as the ui lists it, apart from [`SkillSummary`], which is what the
+/// writer is prompted with.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SkillListing {
+    pub id: i64,
+    pub name: String,
+    pub when_to_use: String,
+    /// Cut to [`LISTED_BODY_CHARS`], so one runaway skill can't stall the ui.
+    pub body: String,
+    /// Unix seconds.
+    pub updated_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -829,6 +845,37 @@ impl MemoryStore {
                 })
             })
             .collect()
+    }
+
+    /// Every skill with its body, the most recently updated first.
+    pub fn skills(&self) -> Result<Vec<SkillListing>, StoreError> {
+        let rows = self.rows(
+            "SELECT id, name, when_to_use, substr(body, 1, ?1), updated_at FROM memories \
+             WHERE kind = 'skill' ORDER BY updated_at DESC, id DESC",
+            vec![integer(LISTED_BODY_CHARS as i64)],
+        )?;
+        rows.iter()
+            .map(|row| {
+                Ok(SkillListing {
+                    id: int_at(row, 0)?,
+                    name: text_at(row, 1)?,
+                    when_to_use: text_at(row, 2)?,
+                    body: text_at(row, 3)?,
+                    updated_at: int_at(row, 4)?,
+                })
+            })
+            .collect()
+    }
+
+    /// Permanently removes a skill. False when there was none with `id`.
+    pub fn delete_skill(&self, id: i64) -> Result<bool, StoreError> {
+        self.write(|store| {
+            let deleted = store.execute(
+                "DELETE FROM memories WHERE kind = 'skill' AND id = ?1",
+                vec![integer(id)],
+            )?;
+            Ok(deleted > 0)
+        })
     }
 
     // Running sql ///////////////////////
