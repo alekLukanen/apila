@@ -1,5 +1,6 @@
 pub mod bash;
 pub mod end_turn;
+pub mod skills;
 pub mod sqlite;
 pub mod tool;
 pub mod webpage;
@@ -10,6 +11,9 @@ mod test_bash;
 
 #[cfg(test)]
 mod test_end_turn;
+
+#[cfg(test)]
+mod test_skills;
 
 #[cfg(test)]
 mod test_sqlite;

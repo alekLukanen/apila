@@ -1,17 +1,24 @@
 use std::{fs, path::Path, time::Duration};
 
 use crate::core::config::config::Config;
-use crate::core::openrouter::types::Message;
+use crate::core::memory::recorder::JobState;
+use crate::core::memory::store::{
+    memory_path, MemoryStore, NewSkill, SessionRecord, SessionStatus, SkillsSaved,
+};
+use crate::core::openrouter::types::{Message, Spend};
 use crate::core::runtime::agent::AgentState;
 use crate::core::runtime::agent_config::{
     ConfigFilesError, AGENTS_FILE_NAME, AGENT_CONFIG_FILE_NAME, SYSTEM_FILE_NAME,
 };
 use crate::core::test_support::{
-    agent_dir, project_dir, project_with_delayed_server, project_with_script, project_with_server,
-    wait_until, write_agent_config, write_agent_config_json, write_agent_config_with_tools,
-    write_directive, StubReply, TEST_MODEL,
+    agent_dir, point_project_at, project_dir, project_with_delayed_script,
+    project_with_delayed_server, project_with_routes, project_with_script, project_with_server,
+    wait_until, write_agent_config, write_agent_config_json, write_agent_config_with_skills,
+    write_agent_config_with_tools, write_directive, write_skill_memory, Route, StubOpenRouter,
+    StubReply, STUB_CHAT_TOKENS, TEST_MODEL, TEST_WRITER_MODEL,
 };
 
+use super::agent::ClearOutcome;
 use super::runtime::{Runtime, RuntimeConfig, RuntimeError};
 
 fn runtime(dir: &Path) -> Runtime {
@@ -493,7 +500,10 @@ fn project_with_bash(
     name: &str,
     max_iterations: u32,
     replies: Vec<StubReply>,
-) -> (std::path::PathBuf, crate::core::test_support::StubOpenRouter) {
+) -> (
+    std::path::PathBuf,
+    crate::core::test_support::StubOpenRouter,
+) {
     let (dir, server) = project_with_script(name, replies);
     let builder = agent_dir(&dir, "builder", true);
     write_agent_config_with_tools(
@@ -512,7 +522,12 @@ fn sent_tool_names(request: &str) -> Vec<String> {
         .as_array()
         .expect("tools were sent")
         .iter()
-        .map(|tool| tool["function"]["name"].as_str().expect("a name").to_string())
+        .map(|tool| {
+            tool["function"]["name"]
+                .as_str()
+                .expect("a name")
+                .to_string()
+        })
         .collect()
 }
 
@@ -759,7 +774,11 @@ fn a_message_queued_during_a_tool_loop_never_splits_a_tool_call() {
         "queued-mid-tool",
         5,
         vec![
-            StubReply::tool_call("call_1", "bash", serde_json::json!({"command": "sleep 0.2"})),
+            StubReply::tool_call(
+                "call_1",
+                "bash",
+                serde_json::json!({"command": "sleep 0.2"}),
+            ),
             StubReply::text("done"),
         ],
     );
@@ -969,7 +988,11 @@ fn a_tool_that_panics_does_not_leave_the_agent_working() {
         })
         .collect();
     assert_eq!(tool_messages.len(), 1);
-    assert!(tool_messages[0].contains("went bang"), "{}", tool_messages[0]);
+    assert!(
+        tool_messages[0].contains("went bang"),
+        "{}",
+        tool_messages[0]
+    );
     assert_eq!(server.requests().len(), 2);
 }
 
@@ -1220,4 +1243,756 @@ fn an_agent_without_a_reasoning_block_sends_no_reasoning() {
     );
 
     assert!(requests[0]["reasoning"].is_null(), "{}", requests[0]);
+}
+
+// Sessions and memory ///////////////
+//////////////////////////////////////
+
+/// Every session recorded in the agent's memory database, oldest first.
+fn sessions(agent_dir: &Path) -> Vec<SessionRecord> {
+    match MemoryStore::open_existing(&memory_path(agent_dir)).expect("open the memory") {
+        Some(store) => store.sessions().expect("read the sessions"),
+        None => Vec::new(),
+    }
+}
+
+/// The contents of a recorded session's messages.
+fn recorded(agent_dir: &Path, session: i64) -> Vec<String> {
+    MemoryStore::open_existing(&memory_path(agent_dir))
+        .expect("open the memory")
+        .expect("the memory exists")
+        .session_messages(session)
+        .expect("read the messages")
+        .iter()
+        .map(|message| message.content().unwrap_or("").to_string())
+        .collect()
+}
+
+fn wait_for_status(agent_dir: &Path, index: usize, status: SessionStatus) {
+    wait_until(&format!("session {} to be {:?}", index, status), || {
+        sessions(agent_dir)
+            .get(index)
+            .is_some_and(|session| session.status == status)
+    });
+}
+
+/// The contents of the agent's messages, for comparing whole conversations.
+fn contents(rt: &Runtime, id: &str) -> Vec<String> {
+    rt.agent(id)
+        .expect("agent exists")
+        .messages()
+        .iter()
+        .map(|message| message.content().unwrap_or("").to_string())
+        .collect()
+}
+
+fn wait_until_idle(rt: &Runtime, id: &str) {
+    wait_until("the agent to go idle", || {
+        let agent = rt.agent(id).expect("agent exists");
+        agent.state() == AgentState::Idle && !agent.clear_pending()
+    });
+}
+
+#[test]
+fn every_session_is_recorded_as_it_happens() {
+    let (dir, _server) = project_with_server("record-session", "on it");
+    let builder = agent_dir(&dir, "builder", true);
+    let rt = runtime(&dir);
+
+    rt.start_agent("builder").expect("start");
+    rt.send_agent_message("builder", "hello".into())
+        .expect("send");
+    wait_until_idle(&rt, "builder");
+
+    let recorded_sessions = sessions(&builder);
+    assert_eq!(recorded_sessions.len(), 1);
+    assert_eq!(recorded_sessions[0].status, SessionStatus::Active);
+    assert_eq!(
+        recorded(&builder, recorded_sessions[0].id),
+        vec!["hello", "on it"]
+    );
+}
+
+#[test]
+fn clearing_an_idle_agent_ends_its_session_and_starts_a_new_one() {
+    let (dir, server) = project_with_server("clear-idle", "on it");
+    let builder = agent_dir(&dir, "builder", true);
+    let rt = runtime(&dir);
+    rt.start_agent("builder").expect("start");
+    rt.send_agent_message("builder", "hello".into())
+        .expect("send");
+    wait_until_idle(&rt, "builder");
+
+    assert_eq!(
+        rt.clear_agent_session("builder").expect("clear"),
+        ClearOutcome::Cleared
+    );
+    wait_until("the conversation to be cleared", || {
+        contents(&rt, "builder").is_empty()
+    });
+    wait_until_idle(&rt, "builder");
+
+    // without skills the old session is kept but never analysed
+    wait_for_status(&builder, 0, SessionStatus::Ended);
+    assert!(rt.agent("builder").unwrap().usage().is_none());
+
+    rt.send_agent_message("builder", "again".into())
+        .expect("send");
+    wait_until_idle(&rt, "builder");
+    assert_eq!(contents(&rt, "builder"), vec!["again", "on it"]);
+    let recorded_sessions = sessions(&builder);
+    assert_eq!(recorded_sessions.len(), 2);
+    assert_eq!(
+        recorded(&builder, recorded_sessions[1].id),
+        vec!["again", "on it"]
+    );
+    // the new session's request carries none of the old one
+    let last: serde_json::Value =
+        serde_json::from_str(server.requests().last().unwrap()).expect("json");
+    assert_eq!(last["messages"].as_array().unwrap().len(), 2);
+    // and nothing ever asked for an embedding
+    assert!(server.embedding_requests().is_empty());
+}
+
+#[test]
+fn a_cleared_session_opens_again_on_the_directive() {
+    let (dir, server) = project_with_server("clear-directive", "on it");
+    let builder = agent_dir(&dir, "builder", true);
+    write_directive(&builder, "Review the parser.\n");
+    let rt = runtime(&dir);
+    start_and_wait(&rt, "builder");
+
+    rt.clear_agent_session("builder").expect("clear");
+    wait_until("the directive to go out again", || {
+        server.requests().len() == 2
+    });
+    wait_until_idle(&rt, "builder");
+
+    let agent = rt.agent("builder").unwrap();
+    assert!(agent.opened_with_directive());
+    assert_eq!(
+        contents(&rt, "builder"),
+        vec!["Review the parser.", "on it"]
+    );
+}
+
+#[test]
+fn an_agent_that_has_not_started_has_no_session_to_clear() {
+    let dir = project_dir("clear-configuring");
+    agent_dir(&dir, "builder", true);
+    let rt = runtime(&dir);
+
+    let err = rt.clear_agent_session("builder").expect_err("not started");
+
+    assert!(
+        matches!(err, RuntimeError::AgentNotStarted(ref id) if id == "builder"),
+        "{err:?}"
+    );
+}
+
+/// The turn in flight finishes in the old session, along with what was
+/// already queued for it; what is sent after the clear opens the new one.
+#[test]
+fn a_clear_sent_mid_turn_waits_for_the_turn_to_end() {
+    let (dir, server) =
+        project_with_delayed_server("clear-queued", "on it", Duration::from_millis(200));
+    let builder = agent_dir(&dir, "builder", true);
+    let rt = runtime(&dir);
+    rt.start_agent("builder").expect("start");
+    rt.send_agent_message("builder", "first".into())
+        .expect("send");
+    wait_until("the first request", || server.requests().len() == 1);
+
+    rt.send_agent_message("builder", "before".into())
+        .expect("send");
+    assert_eq!(
+        rt.clear_agent_session("builder").expect("clear"),
+        ClearOutcome::Queued
+    );
+    // a second clear while one waits changes nothing
+    assert_eq!(
+        rt.clear_agent_session("builder").expect("clear"),
+        ClearOutcome::Queued
+    );
+    rt.send_agent_message("builder", "after".into())
+        .expect("send");
+
+    let agent = rt.agent("builder").unwrap();
+    assert!(agent.clear_pending());
+    assert_eq!(agent.queued_messages().len(), 1);
+    assert_eq!(agent.next_session_messages().len(), 1);
+
+    wait_until("the new session's reply", || {
+        contents(&rt, "builder") == vec!["after", "on it"]
+    });
+    wait_until_idle(&rt, "builder");
+
+    let recorded_sessions = sessions(&builder);
+    assert_eq!(recorded_sessions.len(), 2);
+    assert_eq!(recorded_sessions[0].status, SessionStatus::Ended);
+    assert_eq!(
+        recorded(&builder, recorded_sessions[0].id),
+        vec!["first", "on it", "before", "on it"]
+    );
+    assert_eq!(server.requests().len(), 3);
+}
+
+/// The clear can reach the agent's thread before the turn the message began
+/// does; the message is still answered in the session it was sent in.
+#[test]
+fn a_clear_sent_right_after_a_message_waits_for_its_answer() {
+    let (dir, _server) = project_with_server("clear-right-after", "on it");
+    let builder = agent_dir(&dir, "builder", true);
+    let rt = runtime(&dir);
+    rt.start_agent("builder").expect("start");
+
+    rt.send_agent_message("builder", "hello".into())
+        .expect("send");
+    rt.clear_agent_session("builder").expect("clear");
+
+    wait_for_status(&builder, 0, SessionStatus::Ended);
+    wait_until_idle(&rt, "builder");
+    assert_eq!(
+        recorded(&builder, sessions(&builder)[0].id),
+        vec!["hello", "on it"]
+    );
+    assert!(contents(&rt, "builder").is_empty());
+}
+
+#[test]
+fn a_clear_queued_behind_a_failing_turn_carries_what_was_never_answered() {
+    let (dir, server) = project_with_delayed_script(
+        "clear-failed",
+        vec![StubReply::tool_call(
+            "call_1",
+            "nope",
+            serde_json::json!({}),
+        )],
+        Duration::from_millis(200),
+    );
+    let builder = agent_dir(&dir, "builder", true);
+    write_agent_config_with_tools(&builder, TEST_MODEL, 1, serde_json::json!({}));
+    let rt = runtime(&dir);
+    rt.start_agent("builder").expect("start");
+    rt.send_agent_message("builder", "first".into())
+        .expect("send");
+    // in flight, so "before" is queued behind a request already sent
+    wait_until("the first request", || server.requests().len() == 1);
+
+    rt.send_agent_message("builder", "before".into())
+        .expect("send");
+    rt.clear_agent_session("builder").expect("clear");
+    rt.send_agent_message("builder", "after".into())
+        .expect("send");
+
+    // the old turn runs out of iterations with "before" still queued, so the
+    // new session opens on it and then on "after"
+    wait_until("the new session to open", || {
+        let contents = contents(&rt, "builder");
+        contents.len() >= 2 && contents[0] == "before" && contents[1] == "after"
+    });
+    wait_until_settled(&rt, "builder");
+    assert_eq!(sessions(&builder)[0].status, SessionStatus::Ended);
+    assert_eq!(recorded(&builder, sessions(&builder)[0].id)[0], "first");
+}
+
+/// The agent's and the writer's requests both go to the routed stub; the
+/// writer is told apart by its model.
+fn project_with_skills(
+    name: &str,
+    agent: Vec<StubReply>,
+    writer: Vec<StubReply>,
+) -> (std::path::PathBuf, StubOpenRouter) {
+    let (dir, server) = project_with_routes(
+        name,
+        vec![
+            (Route::Chat(TEST_MODEL.into()), agent),
+            (Route::Chat(TEST_WRITER_MODEL.into()), writer),
+            (
+                Route::Embeddings,
+                vec![StubReply::embedding(vec![1.0, 0.0])],
+            ),
+        ],
+    );
+    let builder = agent_dir(&dir, "builder", true);
+    write_agent_config_with_skills(
+        &builder,
+        TEST_MODEL,
+        TEST_WRITER_MODEL,
+        serde_json::json!({"enabled": ["sqlite"]}),
+    );
+    (dir, server)
+}
+
+fn writer_saves_a_skill() -> Vec<StubReply> {
+    vec![
+        StubReply::tool_call(
+            "w1",
+            "save_skill",
+            serde_json::json!({
+                "name": "fetch-webpage-into-sqlite",
+                "when_to_use": "The user asks to save a web page into a database.",
+                "body": "## Steps\n1. create `hn`\n## Artifacts\n`hn`\n## Pitfalls\nnone",
+            }),
+        ),
+        StubReply::tool_call("w2", "end_turn", serde_json::json!({})),
+    ]
+}
+
+#[test]
+fn a_cleared_session_is_analysed_into_a_skill_when_skills_are_on() {
+    let (dir, server) = project_with_skills(
+        "clear-skills",
+        vec![StubReply::text("on it")],
+        writer_saves_a_skill(),
+    );
+    let builder = dir.join("builder");
+    let rt = runtime(&dir);
+    rt.start_agent("builder").expect("start");
+    rt.send_agent_message("builder", "save hacker news".into())
+        .expect("send");
+    wait_until_idle(&rt, "builder");
+
+    rt.clear_agent_session("builder").expect("clear");
+    wait_for_status(&builder, 0, SessionStatus::Analysed);
+
+    let store = MemoryStore::open_existing(&memory_path(&builder))
+        .unwrap()
+        .unwrap();
+    let skills = store.list_skills(10).expect("skills");
+    assert_eq!(skills.len(), 1);
+    assert_eq!(skills[0].name, "fetch-webpage-into-sqlite");
+    wait_until("the status to say so", || {
+        let view = rt.agent("builder").unwrap().memory_view();
+        view.skills == Some(1)
+            && view.pending == Some(0)
+            && view.last_job.is_some_and(|job| job.state == added_one())
+    });
+    assert_eq!(rt.agent("builder").unwrap().memory_status(), None);
+    assert!(server.chat_requests(TEST_WRITER_MODEL)[0].contains("save hacker news"));
+}
+
+#[test]
+fn a_cleared_session_is_analysed_with_the_agents_skill_memory_file() {
+    let (dir, server) = project_with_skills(
+        "clear-skill-memory",
+        vec![StubReply::text("on it")],
+        writer_saves_a_skill(),
+    );
+    let builder = dir.join("builder");
+    write_skill_memory(&dir, "Save what the project says.");
+    write_skill_memory(&builder, "Only save procedures that create sqlite tables.");
+    let rt = runtime(&dir);
+    rt.start_agent("builder").expect("start");
+    rt.send_agent_message("builder", "save hacker news".into())
+        .expect("send");
+    wait_until_idle(&rt, "builder");
+
+    rt.clear_agent_session("builder").expect("clear");
+    wait_for_status(&builder, 0, SessionStatus::Analysed);
+
+    let chat = server.chat_requests(TEST_WRITER_MODEL);
+    let request: serde_json::Value = serde_json::from_str(&chat[0]).expect("json");
+    let system = request["messages"][0]["content"]
+        .as_str()
+        .expect("system prompt");
+    assert!(
+        system.contains("Only save procedures that create sqlite tables."),
+        "{system}"
+    );
+    assert!(!system.contains("Save what the project says."), "{system}");
+    assert!(!system.contains("## Pitfalls"), "{system}");
+}
+
+#[test]
+fn a_session_left_open_is_analysed_by_the_next_process() {
+    let (dir, _first) = project_with_skills(
+        "recover-skills",
+        vec![StubReply::text("on it")],
+        writer_saves_a_skill(),
+    );
+    let builder = dir.join("builder");
+    {
+        let rt = runtime(&dir);
+        rt.start_agent("builder").expect("start");
+        rt.send_agent_message("builder", "save hacker news".into())
+            .expect("send");
+        wait_until_idle(&rt, "builder");
+        // apila closes without a clear
+    }
+    assert_eq!(sessions(&builder)[0].status, SessionStatus::Active);
+
+    let second = StubOpenRouter::start_routed(vec![
+        (
+            Route::Chat(TEST_WRITER_MODEL.into()),
+            writer_saves_a_skill(),
+        ),
+        (
+            Route::Embeddings,
+            vec![StubReply::embedding(vec![1.0, 0.0])],
+        ),
+    ]);
+    point_project_at(&dir, &second);
+    let _rt = runtime(&dir);
+
+    // nothing is started; loading the agent is enough
+    wait_for_status(&builder, 0, SessionStatus::Analysed);
+    assert_eq!(second.chat_requests(TEST_WRITER_MODEL).len(), 2);
+}
+
+#[test]
+fn without_skills_a_session_left_open_is_only_ended_by_the_next_process() {
+    let (dir, _server) = project_with_server("recover-plain", "on it");
+    let builder = agent_dir(&dir, "builder", true);
+    {
+        let rt = runtime(&dir);
+        rt.start_agent("builder").expect("start");
+        rt.send_agent_message("builder", "hello".into())
+            .expect("send");
+        wait_until_idle(&rt, "builder");
+    }
+
+    let _rt = runtime(&dir);
+
+    wait_for_status(&builder, 0, SessionStatus::Ended);
+}
+
+#[test]
+fn an_agent_finds_and_reads_a_skill_in_a_later_session() {
+    let (dir, _first) = project_with_skills(
+        "recall-skills",
+        vec![
+            StubReply::tool_call(
+                "a1",
+                "sqlite",
+                serde_json::json!({"action": "create", "database": "hn"}),
+            ),
+            StubReply::tool_call(
+                "a2",
+                "sqlite",
+                serde_json::json!({
+                    "action": "execute",
+                    "database": "hn",
+                    "sql": "CREATE TABLE stories (title TEXT); INSERT INTO stories VALUES ('a');"
+                }),
+            ),
+            StubReply::text("saved"),
+        ],
+        writer_saves_a_skill(),
+    );
+    let builder = dir.join("builder");
+    {
+        let rt = runtime(&dir);
+        rt.start_agent("builder").expect("start");
+        rt.send_agent_message("builder", "save hacker news".into())
+            .expect("send");
+        wait_until_idle(&rt, "builder");
+        rt.clear_agent_session("builder").expect("clear");
+        wait_for_status(&builder, 0, SessionStatus::Analysed);
+    }
+
+    let second = StubOpenRouter::start_routed(vec![
+        (
+            Route::Chat(TEST_MODEL.into()),
+            vec![
+                StubReply::tool_call(
+                    "b1",
+                    "search_skills",
+                    serde_json::json!({"request": "save hacker news"}),
+                ),
+                StubReply::tool_call("b2", "get_skill", serde_json::json!({"id": 1})),
+                StubReply::tool_call("b3", "sqlite", serde_json::json!({"action": "list"})),
+                StubReply::text("done"),
+            ],
+        ),
+        (
+            Route::Embeddings,
+            vec![StubReply::embedding(vec![1.0, 0.0])],
+        ),
+    ]);
+    point_project_at(&dir, &second);
+    let rt = runtime(&dir);
+    rt.start_agent("builder").expect("start");
+    rt.send_agent_message("builder", "save hacker news again".into())
+        .expect("send");
+    wait_until_idle(&rt, "builder");
+
+    let tool_results: Vec<String> = rt
+        .agent("builder")
+        .unwrap()
+        .messages()
+        .iter()
+        .filter(|message| matches!(message, Message::Tool { .. }))
+        .map(|message| message.content().unwrap_or("").to_string())
+        .collect();
+    assert_eq!(tool_results.len(), 3);
+    assert!(
+        tool_results[0].contains("1 | fetch-webpage-into-sqlite | 1.00"),
+        "{}",
+        tool_results[0]
+    );
+    assert!(
+        tool_results[1].contains("1. create `hn`"),
+        "{}",
+        tool_results[1]
+    );
+    assert_eq!(tool_results[2], "hn (1 table)");
+
+    let sent = sent_tool_names(&second.chat_requests(TEST_MODEL)[0]);
+    assert!(sent.contains(&"search_skills".to_string()));
+    assert!(sent.contains(&"get_skill".to_string()));
+}
+
+#[test]
+fn an_agent_without_skills_is_not_offered_the_skill_tools() {
+    let (dir, server) = project_with_bash("no-skill-tools", 5, vec![StubReply::text("done")]);
+    let rt = runtime(&dir);
+    rt.start_agent("builder").expect("start");
+    rt.send_agent_message("builder", "hello".into())
+        .expect("send");
+    wait_until_idle(&rt, "builder");
+
+    assert_eq!(
+        sent_tool_names(&server.requests()[0]),
+        vec!["end_turn", "bash"]
+    );
+}
+
+// Costs /////////////////////////////
+//////////////////////////////////////
+
+/// What `replies` scripted chat replies cost together.
+fn chat_spend(replies: u64) -> Spend {
+    Spend::new(replies * STUB_CHAT_TOKENS, replies as i64 * 100_000, 0)
+}
+
+fn wait_until_loaded(rt: &Runtime, id: &str) {
+    wait_until("the memory totals to be read", || {
+        rt.agent(id).expect("agent exists").memory_view().loaded
+    });
+}
+
+fn wait_until_job_done(rt: &Runtime, id: &str) {
+    wait_until("the memory job to finish", || {
+        let view = rt.agent(id).expect("agent exists").memory_view();
+        view.pending == Some(0)
+            && view
+                .last_job
+                .is_some_and(|job| matches!(job.state, JobState::Done { .. }))
+    });
+}
+
+#[test]
+fn the_session_cost_resets_on_clear_while_the_total_keeps_growing() {
+    let (dir, _server) = project_with_server("cost-clear", "on it");
+    agent_dir(&dir, "builder", true);
+    let rt = runtime(&dir);
+    wait_until_loaded(&rt, "builder");
+    rt.start_agent("builder").expect("start");
+
+    rt.send_agent_message("builder", "one".into())
+        .expect("send");
+    wait_until_idle(&rt, "builder");
+    let agent = rt.agent("builder").unwrap();
+    assert_eq!(agent.session_spend(), chat_spend(1));
+    assert_eq!(agent.all_sessions_spend(), chat_spend(1));
+
+    rt.send_agent_message("builder", "two".into())
+        .expect("send");
+    wait_until("the second reply", || contents(&rt, "builder").len() == 4);
+    wait_until_idle(&rt, "builder");
+    rt.clear_agent_session("builder").expect("clear");
+    wait_until("the session to clear", || {
+        rt.agent("builder").unwrap().messages().is_empty()
+    });
+
+    let agent = rt.agent("builder").unwrap();
+    assert_eq!(agent.session_spend(), Spend::default());
+    assert_eq!(agent.all_sessions_spend(), chat_spend(2));
+    assert_eq!(agent.memory_spend(), Spend::default());
+}
+
+#[test]
+fn chat_and_memory_costs_are_restored_by_the_next_process() {
+    let (dir, _server) = project_with_skills(
+        "cost-restart",
+        vec![StubReply::text("on it")],
+        writer_saves_a_skill(),
+    );
+    // two writer replies, and an embedding that came back without a cost
+    let memory = {
+        let mut memory = chat_spend(2);
+        memory.unpriced = 1;
+        memory
+    };
+    {
+        let rt = runtime(&dir);
+        rt.start_agent("builder").expect("start");
+        rt.send_agent_message("builder", "save hacker news".into())
+            .expect("send");
+        wait_until_idle(&rt, "builder");
+        rt.clear_agent_session("builder").expect("clear");
+        wait_until_job_done(&rt, "builder");
+        let agent = rt.agent("builder").unwrap();
+        assert_eq!(agent.memory_spend(), memory);
+        assert_eq!(agent.all_sessions_spend(), chat_spend(1));
+    }
+
+    let rt = runtime(&dir);
+    wait_until_loaded(&rt, "builder");
+
+    let agent = rt.agent("builder").unwrap();
+    assert_eq!(agent.session_spend(), Spend::default());
+    assert_eq!(agent.all_sessions_spend(), chat_spend(1));
+    assert_eq!(agent.memory_spend(), memory);
+    let view = agent.memory_view();
+    assert_eq!(view.skills, Some(1));
+    let last = view.last_job.expect("the job is remembered");
+    assert_eq!(last.session_id, 1);
+    assert_eq!(last.state, added_one());
+    assert_eq!(last.spend, memory);
+
+    // a new session adds to the restored total rather than replacing it
+    rt.start_agent("builder").expect("start");
+    rt.send_agent_message("builder", "again".into())
+        .expect("send");
+    wait_until_idle(&rt, "builder");
+    assert_eq!(
+        rt.agent("builder").unwrap().all_sessions_spend(),
+        chat_spend(2)
+    );
+}
+
+#[test]
+fn an_agent_without_skills_keeps_its_chat_cost_across_a_restart() {
+    let (dir, _server) = project_with_server("cost-no-skills", "on it");
+    agent_dir(&dir, "builder", true);
+    {
+        let rt = runtime(&dir);
+        rt.start_agent("builder").expect("start");
+        rt.send_agent_message("builder", "hello".into())
+            .expect("send");
+        wait_until_idle(&rt, "builder");
+    }
+
+    let rt = runtime(&dir);
+    wait_until_loaded(&rt, "builder");
+
+    let agent = rt.agent("builder").unwrap();
+    assert_eq!(agent.all_sessions_spend(), chat_spend(1));
+    assert_eq!(agent.memory_spend(), Spend::default());
+    assert_eq!(agent.memory_view().last_job, None);
+}
+
+#[test]
+fn an_agent_with_no_memory_database_starts_from_nothing() {
+    let dir = project_dir("cost-no-database");
+    let builder = agent_dir(&dir, "builder", true);
+    let rt = runtime(&dir);
+    wait_until_loaded(&rt, "builder");
+
+    let agent = rt.agent("builder").unwrap();
+    assert_eq!(agent.all_sessions_spend(), Spend::default());
+    assert_eq!(agent.memory_spend(), Spend::default());
+    let view = agent.memory_view();
+    assert_eq!(view.skills, Some(0));
+    assert_eq!(view.last_job, None);
+    assert_eq!(view.message, None);
+    // reading the totals never creates the database
+    assert!(!memory_path(&builder).exists());
+}
+
+fn added_one() -> JobState {
+    JobState::Done {
+        skills: SkillsSaved {
+            added: 1,
+            updated: 0,
+        },
+    }
+}
+
+// Viewing memories //////////////////
+//////////////////////////////////////
+
+/// Saves skills straight into an agent's memory database, as an earlier
+/// process would have. Returns their ids.
+fn seed_skills(agent_dir: &Path, names: &[&str]) -> Vec<i64> {
+    let store = MemoryStore::create(&memory_path(agent_dir)).expect("create the memory");
+    names
+        .iter()
+        .map(|name| {
+            store
+                .upsert_skill(&NewSkill {
+                    name: name.to_string(),
+                    when_to_use: format!("when {} is needed", name),
+                    body: format!("## Steps\n{}", name),
+                    embedding: vec![1.0, 0.0],
+                    embedding_model: "test-embedding".into(),
+                    source_session: None,
+                })
+                .expect("save a skill")
+                .0
+        })
+        .collect()
+}
+
+#[test]
+fn an_agent_that_never_started_lists_its_skills() {
+    let dir = project_dir("skills-list");
+    let builder = agent_dir(&dir, "builder", true);
+    seed_skills(&builder, &["fetch", "parse"]);
+    let rt = runtime(&dir);
+
+    let skills = rt.agent_skills("builder").expect("list skills");
+    let names: Vec<&str> = skills.iter().map(|skill| skill.name.as_str()).collect();
+    assert_eq!(names, vec!["parse", "fetch"]);
+    assert_eq!(skills[1].body, "## Steps\nfetch");
+    assert!(!rt.agent("builder").unwrap().state().started());
+}
+
+#[test]
+fn deleting_a_skill_recounts_the_agents_skills() {
+    let dir = project_dir("skills-delete");
+    let builder = agent_dir(&dir, "builder", true);
+    let ids = seed_skills(&builder, &["fetch", "parse"]);
+    let rt = runtime(&dir);
+    wait_until_loaded(&rt, "builder");
+    assert_eq!(rt.agent("builder").unwrap().memory_view().skills, Some(2));
+
+    assert!(rt.delete_agent_skill("builder", ids[0]).expect("delete"));
+    assert!(!rt
+        .delete_agent_skill("builder", ids[0])
+        .expect("delete again"));
+
+    assert_eq!(rt.agent("builder").unwrap().memory_view().skills, Some(1));
+    let skills = rt.agent_skills("builder").expect("list skills");
+    assert_eq!(skills.len(), 1);
+    assert_eq!(skills[0].name, "parse");
+}
+
+#[test]
+fn an_agent_with_no_memory_database_has_no_skills_to_list() {
+    let dir = project_dir("skills-none");
+    let builder = agent_dir(&dir, "builder", true);
+    let rt = runtime(&dir);
+
+    assert!(rt.agent_skills("builder").expect("list skills").is_empty());
+    assert!(!rt.delete_agent_skill("builder", 1).expect("delete"));
+    // looking never creates the database
+    assert!(!memory_path(&builder).exists());
+}
+
+#[test]
+fn skills_of_an_unknown_agent_are_refused() {
+    let dir = project_dir("skills-unknown");
+    let rt = runtime(&dir);
+
+    assert!(matches!(
+        rt.agent_skills("nobody"),
+        Err(RuntimeError::UnknownAgent(id)) if id == "nobody"
+    ));
+    assert!(matches!(
+        rt.delete_agent_skill("nobody", 1),
+        Err(RuntimeError::UnknownAgent(_))
+    ));
 }

@@ -1,5 +1,6 @@
 use std::{
-    fs,
+    fs::{self, File},
+    io::Read,
     path::{Path, PathBuf},
 };
 
@@ -20,11 +21,26 @@ pub const AGENTS_FILE_NAME: &str = "AGENTS.md";
 /// agent's restrictions and general guidelines. Looked up in the agent's
 /// directory first, then in the project directory.
 pub const SYSTEM_FILE_NAME: &str = "SYSTEM.md";
+/// Tells the skill memory writer what to save and how to write it. Optional,
+/// read only when skills are enabled. Looked up in the agent's directory first,
+/// then in the project directory.
+pub const SKILL_MEMORY_FILE_NAME: &str = "SKILL_MEMORY.md";
+
+/// The largest `SKILL_MEMORY.md` an agent may have, since all of it goes into
+/// every request the writer makes.
+pub const MAX_SKILL_MEMORY_BYTES: usize = 16 * 1024;
 
 /// The iteration bound of an agent that has not read its `config.json` yet.
 /// Every started agent overwrites it from its own settings, which are required
 /// to name one; this exists so an unconfigured config is never a trap.
 pub const DEFAULT_MAX_ITERATIONS: u32 = 10;
+
+/// How close a skill has to be to a request before `search_skills` returns it,
+/// unless `memory.skills.min_similarity` says otherwise.
+pub const DEFAULT_MIN_SIMILARITY: f64 = 0.25;
+
+/// The tools that come with `memory.skills` rather than with `tools.enabled`.
+pub const SKILL_TOOL_NAMES: [&str; 2] = ["search_skills", "get_skill"];
 
 #[derive(Clone)]
 pub struct AgentConfig {
@@ -33,6 +49,7 @@ pub struct AgentConfig {
     dir: PathBuf,
     max_iterations: u32,
     reasoning_effort: Option<ReasoningEffort>,
+    memory: MemorySettings,
 }
 
 impl AgentConfig {
@@ -43,6 +60,7 @@ impl AgentConfig {
             dir: PathBuf::new(),
             max_iterations: DEFAULT_MAX_ITERATIONS,
             reasoning_effort: None,
+            memory: MemorySettings::default(),
         }
     }
     pub fn name(&self) -> String {
@@ -62,6 +80,9 @@ impl AgentConfig {
     /// Unset leaves the choice to the provider.
     pub fn reasoning_effort(&self) -> Option<ReasoningEffort> {
         self.reasoning_effort
+    }
+    pub fn memory(&self) -> MemorySettings {
+        self.memory.clone()
     }
     /// The model with its effort, if any. A model that failed to load shows
     /// as unset alone, since the effort came from the same failed file.
@@ -93,6 +114,10 @@ impl AgentConfig {
         self.reasoning_effort = effort;
         self
     }
+    pub fn set_memory(mut self, memory: MemorySettings) -> AgentConfig {
+        self.memory = memory;
+        self
+    }
 
     /// Everything the agent's `config.json` decides, moved onto the config the
     /// runtime holds, so a setting added to the file is wired through in one
@@ -101,6 +126,7 @@ impl AgentConfig {
         self.set_model(config_files.model())
             .set_max_iterations(config_files.agent_max_iterations())
             .set_reasoning_effort(config_files.reasoning_effort())
+            .set_memory(config_files.memory())
     }
 
     /// What the agent runs with when its `config.json` could not be read. The
@@ -110,6 +136,7 @@ impl AgentConfig {
         self.set_model(Model::empty())
             .set_max_iterations(DEFAULT_MAX_ITERATIONS)
             .set_reasoning_effort(None)
+            .set_memory(MemorySettings::default())
     }
 }
 
@@ -205,6 +232,116 @@ pub struct AgentSettings {
 
     #[serde(default)]
     pub tools: ToolSettings,
+
+    #[serde(default)]
+    pub memory: Option<MemoryBlock>,
+}
+
+/// The agent's `memory` block, as written. One field per kind of memory so a
+/// new kind is a new block rather than new keys beside the old ones.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryBlock {
+    #[serde(default)]
+    pub skills: Option<SkillsBlock>,
+}
+
+/// `memory.skills` as written. Everything but `enabled` is optional here and
+/// checked in [`MemorySettings::resolve`], since what is required depends on it.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillsBlock {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub embedding_model: Option<String>,
+    #[serde(default)]
+    pub min_similarity: Option<f64>,
+    #[serde(default)]
+    pub writer_model: Option<String>,
+    /// Signed so a negative count is reported as a bad setting rather than
+    /// as json that does not parse.
+    #[serde(default)]
+    pub writer_max_iterations: Option<i64>,
+}
+
+/// The agent's `memory` block with every default filled in and every value
+/// checked, worked out once when the files are read.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MemorySettings {
+    /// Present only when skills are enabled.
+    pub skills: Option<SkillsSettings>,
+}
+
+/// What an agent that learns skills from its past sessions runs with.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SkillsSettings {
+    pub embedding_model: String,
+    pub min_similarity: f64,
+    /// An "author/slug" id; the agent's own model unless one is named.
+    pub writer_model: String,
+    pub writer_max_iterations: u32,
+    /// The text of `SKILL_MEMORY.md`, trimmed; unset when there is none, which
+    /// leaves the writer on its own guidance.
+    pub instructions: Option<String>,
+}
+
+impl MemorySettings {
+    fn resolve(block: Option<&MemoryBlock>, model: &Model) -> Result<MemorySettings, String> {
+        let Some(skills) = block.and_then(|block| block.skills.as_ref()) else {
+            return Ok(MemorySettings::default());
+        };
+        if !skills.enabled {
+            return Ok(MemorySettings::default());
+        }
+
+        let embedding_model = match &skills.embedding_model {
+            Some(model) if model.trim() != "" => model.trim().to_string(),
+            _ => return Err("`skills.embedding_model` is required when skills are enabled".into()),
+        };
+
+        let min_similarity = skills.min_similarity.unwrap_or(DEFAULT_MIN_SIMILARITY);
+        if !(-1.0..=1.0).contains(&min_similarity) {
+            return Err("`skills.min_similarity` must be between -1 and 1".into());
+        }
+
+        let writer_model = match &skills.writer_model {
+            Some(writer_model) => Model::parse(writer_model)
+                .ok_or_else(|| {
+                    format!(
+                        "`skills.writer_model` is not an \"author/slug\" id: {}",
+                        writer_model
+                    )
+                })?
+                .full_slug(),
+            None => model.full_slug(),
+        };
+
+        let writer_max_iterations = match skills.writer_max_iterations {
+            Some(count) if count >= 1 => u32::try_from(count)
+                .map_err(|_| "`skills.writer_max_iterations` is too large".to_string())?,
+            Some(_) => return Err("`skills.writer_max_iterations` must be at least 1".into()),
+            None => {
+                return Err(
+                    "`skills.writer_max_iterations` is required when skills are enabled".into(),
+                )
+            }
+        };
+
+        Ok(MemorySettings {
+            skills: Some(SkillsSettings {
+                embedding_model,
+                min_similarity,
+                writer_model,
+                writer_max_iterations,
+                instructions: None,
+            }),
+        })
+    }
+
+    pub fn skills_enabled(&self) -> bool {
+        self.skills.is_some()
+    }
 }
 
 /// Each tool's settings stay raw json so registering a new tool never means
@@ -269,6 +406,9 @@ pub enum ConfigFilesError {
     /// registry, which this file knows nothing about.
     #[error("`tools` is not usable: {0}")]
     InvalidTools(String),
+
+    #[error("`memory` is not usable: {0}")]
+    InvalidMemory(String),
 }
 
 /// The files an agent is configured from, and whether each one was found.
@@ -280,17 +420,19 @@ pub struct ConfigFiles {
     agents_file: ConfigFile,
     system_file: ConfigFile,
     directive_file: ConfigFile,
+    skill_memory_file: ConfigFile,
 
     /// The parsed `config.json`.
     settings: AgentSettings,
     /// The model named by `settings`, already split into author and slug.
     model: Model,
+    memory: MemorySettings,
 }
 
 impl ConfigFiles {
-    /// The system prompt may live in `project_dir` so every agent can share
-    /// one. A bad or missing `config.json` is an error, not a gap shown beside
-    /// the other files, since nothing can stand in for its model.
+    /// `SYSTEM.md` and `SKILL_MEMORY.md` may live in `project_dir` so agents can
+    /// share them. A bad `config.json` or a `SKILL_MEMORY.md` that cannot be used
+    /// is an error, not a gap shown beside the other files.
     pub fn load(dir: &Path, project_dir: &Path) -> Result<ConfigFiles, ConfigFilesError> {
         let config_path = dir.join(AGENT_CONFIG_FILE_NAME);
         let config_file = ConfigFile {
@@ -318,6 +460,9 @@ impl ConfigFiles {
         if settings.agent_max_iterations == 0 {
             return Err(ConfigFilesError::InvalidMaxIterations);
         }
+        let mut memory = MemorySettings::resolve(settings.memory.as_ref(), &model)
+            .map_err(ConfigFilesError::InvalidMemory)?;
+        reject_skill_tools(&settings.tools).map_err(ConfigFilesError::InvalidMemory)?;
 
         let agents_path = dir.join(AGENTS_FILE_NAME);
         let agents_file = ConfigFile {
@@ -348,13 +493,32 @@ impl ConfigFiles {
             required: false,
         };
 
+        let local_skill_memory_path = dir.join(SKILL_MEMORY_FILE_NAME);
+        let skill_memory_path = if local_skill_memory_path.is_file() {
+            local_skill_memory_path
+        } else {
+            project_dir.join(SKILL_MEMORY_FILE_NAME)
+        };
+        let skill_memory_file = ConfigFile {
+            name: SKILL_MEMORY_FILE_NAME.into(),
+            present: skill_memory_path.is_file(),
+            path: skill_memory_path,
+            required: false,
+        };
+        if let Some(skills) = memory.skills.as_mut() {
+            skills.instructions =
+                read_skill_memory(&skill_memory_file).map_err(ConfigFilesError::InvalidMemory)?;
+        }
+
         Ok(ConfigFiles {
             config_file,
             agents_file,
             system_file,
             directive_file,
+            skill_memory_file,
             settings,
             model,
+            memory,
         })
     }
 
@@ -387,18 +551,47 @@ impl ConfigFiles {
     pub fn reasoning_effort(&self) -> Option<ReasoningEffort> {
         self.settings.reasoning.as_ref().and_then(|r| r.effort)
     }
-    /// The agent's `tools` block, as written. Working out which tools it comes
-    /// to is the runtime's job, since only it holds the registry.
-    pub fn tool_settings(&self) -> ToolSettings {
-        self.settings.tools.clone()
+    pub fn memory(&self) -> MemorySettings {
+        self.memory.clone()
     }
+    /// The agent's `tools` block, plus the skill tools when `memory.skills`
+    /// turns them on. Working out which tools it comes to is the runtime's job,
+    /// since only it holds the registry.
+    pub fn tool_settings(&self) -> ToolSettings {
+        let mut tools = self.settings.tools.clone();
+        if let Some(skills) = &self.memory.skills {
+            tools
+                .enabled
+                .extend(SKILL_TOOL_NAMES.iter().map(|name| name.to_string()));
+            let mut settings = serde_json::Map::new();
+            settings.insert(
+                "embedding_model".into(),
+                serde_json::Value::String(skills.embedding_model.clone()),
+            );
+            settings.insert(
+                "min_similarity".into(),
+                serde_json::json!(skills.min_similarity),
+            );
+            tools.configs.push(ToolConfig {
+                tool: SKILL_TOOL_NAMES[0].into(),
+                settings,
+            });
+        }
+        tools
+    }
+    /// `SKILL_MEMORY.md` is listed only when skills are enabled, since it does
+    /// nothing otherwise.
     pub fn files(&self) -> Vec<ConfigFile> {
-        vec![
+        let mut files = vec![
             self.config_file.clone(),
             self.system_file.clone(),
             self.agents_file.clone(),
             self.directive_file.clone(),
-        ]
+        ];
+        if self.memory.skills_enabled() {
+            files.push(self.skill_memory_file.clone());
+        }
+        files
     }
     /// The first required file that isn't there, if any.
     pub fn missing_file(&self) -> Option<ConfigFile> {
@@ -408,5 +601,62 @@ impl ConfigFiles {
     /// is already accounted for: these only exist because it loaded.
     pub fn complete(&self) -> bool {
         self.missing_file().is_none()
+    }
+}
+
+/// The skill tools are switched on and configured by `memory.skills` alone, so
+/// a `tools` block naming them could only disagree with it.
+fn reject_skill_tools(tools: &ToolSettings) -> Result<(), String> {
+    let named = tools
+        .enabled
+        .iter()
+        .chain(tools.configs.iter().map(|config| &config.tool))
+        .find(|name| SKILL_TOOL_NAMES.contains(&name.as_str()));
+    match named {
+        Some(name) => Err(format!(
+            "`{}` cannot be named in `tools`; skills are configured with `memory.skills`",
+            name
+        )),
+        None => Ok(()),
+    }
+}
+
+/// The writer's instructions out of `SKILL_MEMORY.md`. A file that is absent or
+/// blank leaves none; one that cannot be read or is too large is an error.
+fn read_skill_memory(file: &ConfigFile) -> Result<Option<String>, String> {
+    if !file.present() {
+        return Ok(None);
+    }
+    let unreadable = |err: String| {
+        format!(
+            "`{}` could not be read ({}): {}",
+            SKILL_MEMORY_FILE_NAME,
+            file.path().display(),
+            err
+        )
+    };
+
+    // one byte past the limit is enough to tell the file is too large
+    let mut buf = Vec::new();
+    File::open(file.path())
+        .and_then(|f| {
+            f.take(MAX_SKILL_MEMORY_BYTES as u64 + 1)
+                .read_to_end(&mut buf)
+        })
+        .map_err(|err| unreadable(err.to_string()))?;
+    if buf.len() > MAX_SKILL_MEMORY_BYTES {
+        return Err(format!(
+            "`{}` ({}) is larger than {} bytes",
+            SKILL_MEMORY_FILE_NAME,
+            file.path().display(),
+            MAX_SKILL_MEMORY_BYTES
+        ));
+    }
+    let text = String::from_utf8(buf).map_err(|err| unreadable(err.to_string()))?;
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text).trim();
+    if text.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(text.to_string()))
     }
 }

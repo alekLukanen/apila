@@ -1,15 +1,17 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crossterm::event::KeyModifiers;
+use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::{
     crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind},
-    layout::{Constraint, Layout, Rect},
+    layout::{Constraint, Layout, Position, Rect},
     style::{Color, Style, Stylize},
     symbols::border,
     text::{Line, Span, Text},
-    widgets::{Block, Cell, HighlightSpacing, Padding, Paragraph, Row, Table, TableState, Wrap},
+    widgets::{
+        Block, Cell, HighlightSpacing, Padding, Paragraph, Row, Table, TableState, Tabs, Wrap,
+    },
     DefaultTerminal, Frame,
 };
 use thiserror::Error;
@@ -17,13 +19,23 @@ use thiserror::Error;
 use clap::Parser;
 
 use crate::core::config::config;
-use crate::core::openrouter::types::Message;
-use crate::core::runtime::agent::{AgentDefinition, AgentState};
+use crate::core::memory::recorder::{JobState, MemoryJob, MemoryView};
+use crate::core::memory::store::SkillsSaved;
+use crate::core::openrouter::types::{Message, Spend};
+use crate::core::runtime::agent::{AgentDefinition, AgentState, ClearOutcome};
 use crate::core::runtime::{agent_config, runtime};
+
+use super::chat_input::{ChatInput, INPUT_MAX_ROWS};
+use super::memories::{self, reload_stamp, MemoriesView, PendingDelete, ReaderView};
+use super::scroll::{self, ChatScroll, WHEEL_LINES};
 
 /// How long the ui waits for a key before redrawing. Agents answer on
 /// background threads, so the screen has to refresh without any input.
 const TICK: Duration = Duration::from_millis(100);
+
+/// Events already waiting are handled before the next redraw, so a fast flick
+/// of the wheel doesn't cost a frame per tick. Capped so the screen still moves.
+const MAX_QUEUED_EVENTS: usize = 64;
 
 /// TODO: read the real context window off the model once it is available.
 const CONTEXT_LIMIT_TOKENS: u64 = 1_000_000;
@@ -35,7 +47,14 @@ const TOOL_OUTPUT_LINES: usize = 12;
 /// The column a tab advances to. Terminals use eight and files are written
 /// expecting it, so anything else would misalign the thing the transcript is
 /// trying to show faithfully.
-const TAB_WIDTH: usize = 8;
+pub(super) const TAB_WIDTH: usize = 8;
+
+/// The widest a figure on an agent row's cost line may be, so the whole line
+/// fits the narrowest list a normal terminal gives it.
+const COMPACT_COST_WIDTH: usize = 5;
+
+/// Typed into the chat, ends the agent's session and starts a new one.
+const CLEAR_COMMAND: &str = "/clear";
 
 #[derive(Debug, Parser)]
 #[command(version, about, long_about = None)]
@@ -67,11 +86,31 @@ pub enum TUIAppError {
 }
 
 /// Where key presses go. The agent list drives everything until the user
-/// steps into an agent's chat.
+/// steps into an agent's chat or its memories.
 #[derive(Debug, PartialEq)]
 enum Focus {
     Agents,
     Chat,
+    Memories,
+}
+
+/// What the detail window shows under the agent's configuration. Kept when
+/// another agent is selected.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum DetailTab {
+    Session,
+    Memories,
+}
+
+/// Where the selected agent's chat was last drawn, so the wheel and paging keys
+/// know what they are scrolling and Up/Down know how the input wraps.
+#[derive(Debug, Clone)]
+struct ChatView {
+    agent_id: String,
+    transcript_area: Rect,
+    max_top: usize,
+    height: usize,
+    input_width: usize,
 }
 
 #[derive(Debug)]
@@ -81,11 +120,24 @@ pub struct TUIApp {
 
     agents_table_state: TableState,
     /// The half typed chat message for each agent.
-    chat_inputs: HashMap<String, String>,
-    /// True while typing into the selected agent's chat box.
+    chat_inputs: HashMap<String, ChatInput>,
+    /// How far back each agent's transcript is scrolled. Missing means it
+    /// follows the newest output.
+    chat_scroll: HashMap<String, ChatScroll>,
+    /// Set while drawing a chat session, and cleared before every redraw.
+    chat_view: Option<ChatView>,
+    /// True while typing into the selected agent's chat box. Kept while in
+    /// the memories, so `<Tab>` can go back to the chat.
     chat_focused: bool,
+    detail_tab: DetailTab,
+    /// True while browsing the selected agent's memories.
+    memories_focused: bool,
+    /// The selected agent's skills, while the Memories tab is showing.
+    memories: Option<MemoriesView>,
     /// Shown along the bottom of the detail window until the next key press.
     status_message: Option<String>,
+    /// The same, for news that is not an error.
+    info_message: Option<String>,
 
     exit: bool,
 }
@@ -120,8 +172,14 @@ impl TUIApp {
             rt,
             agents_table_state,
             chat_inputs: HashMap::new(),
+            chat_scroll: HashMap::new(),
+            chat_view: None,
             chat_focused: false,
+            detail_tab: DetailTab::Session,
+            memories_focused: false,
+            memories: None,
             status_message: None,
+            info_message: None,
             exit: false,
         })
     }
@@ -134,7 +192,7 @@ impl TUIApp {
 
         while !self.exit {
             term.draw(|frame| self.draw(frame))?;
-            self.handle_key_events()?;
+            self.handle_events()?;
         }
 
         Ok(())
@@ -143,24 +201,43 @@ impl TUIApp {
     // Input /////////////////////////////
     //////////////////////////////////////
 
-    fn handle_key_events(&mut self) -> Result<(), TUIAppError> {
+    fn handle_events(&mut self) -> Result<(), TUIAppError> {
         // agents answer on their own threads; the wait has to time out so the
         // screen keeps up with them
         if !event::poll(TICK)? {
             return Ok(());
         }
+        self.handle_event(event::read()?)?;
 
-        let key = match event::read()? {
-            Event::Key(key) if key.kind == KeyEventKind::Press => key,
-            _ => return Ok(()),
-        };
+        for _ in 0..MAX_QUEUED_EVENTS {
+            if self.exit || !event::poll(Duration::ZERO)? {
+                break;
+            }
+            self.handle_event(event::read()?)?;
+        }
+        Ok(())
+    }
 
-        self.handle_key(key)
+    /// Acts on one terminal event, the way the event loop would.
+    pub fn handle_event(&mut self, event: Event) -> Result<(), TUIAppError> {
+        match event {
+            Event::Key(key) if key.kind == KeyEventKind::Press => self.handle_key(key),
+            Event::Mouse(mouse) => {
+                self.handle_mouse(mouse);
+                Ok(())
+            }
+            Event::Paste(text) => {
+                self.handle_paste(&text);
+                Ok(())
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Acts on one key press, whichever window has focus.
     pub fn handle_key(&mut self, key: KeyEvent) -> Result<(), TUIAppError> {
         self.status_message = None;
+        self.info_message = None;
 
         // always available, whatever has focus
         if let KeyEvent {
@@ -173,9 +250,45 @@ impl TUIApp {
             return Ok(());
         }
 
+        // whatever is pressed next answers an armed delete, so nothing else
+        // runs on the key that cancels one
+        if let Some(pending) = self
+            .memories
+            .as_mut()
+            .and_then(|view| view.take_confirmed())
+        {
+            let plain = !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+            if key.code == KeyCode::Char('y') && plain {
+                self.delete_skill(pending);
+            }
+            return Ok(());
+        }
+
+        // the transcript or the open memory scrolls whichever window has focus
+        let page = match key.code {
+            KeyCode::PageUp => Some(-1),
+            KeyCode::PageDown => Some(1),
+            _ => None,
+        };
+        if let Some(direction) = page {
+            match self.detail_tab {
+                DetailTab::Session => self.page_chat(direction),
+                DetailTab::Memories => self.page_memories(direction),
+            }
+            return Ok(());
+        }
+
+        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            self.switch_tab();
+            return Ok(());
+        }
+
         match self.focus() {
             Focus::Agents => self.handle_agents_key(key),
             Focus::Chat => self.handle_chat_key(key),
+            Focus::Memories => self.handle_memories_key(key),
         }
     }
 
@@ -184,11 +297,150 @@ impl TUIApp {
             KeyCode::Char('q') => self.exit = true,
             KeyCode::Down | KeyCode::Char('j') => self.select_agent_offset(1),
             KeyCode::Up | KeyCode::Char('k') => self.select_agent_offset(-1),
-            KeyCode::Char('r') => self.reload_agents(),
-            KeyCode::Enter | KeyCode::Char('i') => self.open_selected_agent(),
+            KeyCode::Char('r') => {
+                self.reload_agents();
+                if self.detail_tab == DetailTab::Memories {
+                    self.load_memories();
+                }
+            }
+            KeyCode::Enter | KeyCode::Char('i') => match self.detail_tab {
+                // browsing an agent's memories never starts it
+                DetailTab::Memories => self.memories_focused = self.selected_agent().is_some(),
+                DetailTab::Session => self.open_selected_agent(),
+            },
             _ => {}
         }
         Ok(())
+    }
+
+    /// From the list it flips the tab; from the chat it steps into the
+    /// memories; from the memories it goes back to wherever it came from.
+    fn switch_tab(&mut self) {
+        match self.focus() {
+            Focus::Agents => {
+                self.detail_tab = match self.detail_tab {
+                    DetailTab::Session => DetailTab::Memories,
+                    DetailTab::Memories => DetailTab::Session,
+                };
+            }
+            Focus::Chat => {
+                self.detail_tab = DetailTab::Memories;
+                self.memories_focused = true;
+            }
+            Focus::Memories => {
+                self.detail_tab = DetailTab::Session;
+                self.memories_focused = false;
+            }
+        }
+        self.refresh_memories();
+    }
+
+    fn handle_memories_key(&mut self, key: KeyEvent) -> Result<(), TUIAppError> {
+        match key.code {
+            KeyCode::Esc => {
+                self.memories_focused = false;
+                self.chat_focused = false;
+            }
+            KeyCode::Down | KeyCode::Char('j') => self.select_memory_offset(1),
+            KeyCode::Up | KeyCode::Char('k') => self.select_memory_offset(-1),
+            KeyCode::Char('r') => self.load_memories(),
+            KeyCode::Char('d') => {
+                if let Some(view) = self.memories.as_mut() {
+                    view.arm_delete();
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn select_memory_offset(&mut self, offset: isize) {
+        if let Some(view) = self.memories.as_mut() {
+            view.select_offset(offset);
+        }
+    }
+
+    fn delete_skill(&mut self, pending: PendingDelete) {
+        match self
+            .rt
+            .delete_agent_skill(&pending.agent_id, pending.skill_id)
+        {
+            Ok(deleted) => {
+                self.info_message = Some(if deleted {
+                    format!("deleted skill `{}`", pending.name)
+                } else {
+                    format!("skill `{}` was already gone", pending.name)
+                });
+                self.load_memories();
+            }
+            Err(err) => self.status_message = Some(err.to_string()),
+        }
+    }
+
+    /// Reads the selected agent's skills again, keeping the selection when
+    /// the view was already showing that agent.
+    fn load_memories(&mut self) {
+        let Some(definition) = self.selected_agent() else {
+            self.memories = None;
+            return;
+        };
+        let id = definition.id();
+        let stamp = reload_stamp(&definition.memory_view());
+        // a failed read keeps what is on screen and is not retried every frame
+        let skills = match self.rt.agent_skills(&id) {
+            Ok(skills) => Some(skills),
+            Err(err) => {
+                self.status_message = Some(err.to_string());
+                None
+            }
+        };
+        match &mut self.memories {
+            Some(view) if view.agent_id() == id => {
+                let skills = skills.unwrap_or_else(|| view.skills().to_vec());
+                view.reload(skills, stamp);
+            }
+            _ => {
+                self.memories = Some(MemoriesView::new(id, skills.unwrap_or_default(), stamp));
+            }
+        }
+    }
+
+    /// Called before every draw. The database is only read when the tab is
+    /// first shown, the agent changes, or the writer has saved since.
+    fn refresh_memories(&mut self) {
+        if self.detail_tab != DetailTab::Memories {
+            self.memories = None;
+            return;
+        }
+        let Some(definition) = self.selected_agent() else {
+            self.memories = None;
+            self.memories_focused = false;
+            return;
+        };
+        let stale = match &self.memories {
+            Some(view) => {
+                view.agent_id() != definition.id()
+                    || view.needs_reload(&reload_stamp(&definition.memory_view()))
+            }
+            None => true,
+        };
+        if stale {
+            self.load_memories();
+        }
+    }
+
+    /// The memories view, if it is the selected agent's.
+    fn selected_memories(&mut self) -> Option<&mut MemoriesView> {
+        let id = self.selected_agent_id()?;
+        self.memories.as_mut().filter(|view| view.agent_id() == id)
+    }
+
+    fn page_memories(&mut self, direction: isize) {
+        if let Some(view) = self.selected_memories() {
+            if let Some(reader) = view.reader() {
+                view.scroll_by(direction * scroll::page_lines(reader.height) as isize);
+            }
+        }
     }
 
     /// `<Enter>` on an agent runs it the first time and steps into its chat
@@ -220,32 +472,147 @@ impl TUIApp {
         let Some(id) = self.selected_agent_id() else {
             return Ok(());
         };
+        // Up/Down follow the rows as drawn; with nothing drawn yet they fall
+        // back to the lines as typed
+        let width = self
+            .selected_chat_view()
+            .map(|view| view.input_width)
+            .unwrap_or(usize::MAX);
+        let modifiers = key.modifiers;
 
         match key.code {
             KeyCode::Esc => self.chat_focused = false,
-            KeyCode::Backspace => {
-                if let Some(input) = self.chat_inputs.get_mut(&id) {
-                    input.pop();
-                }
+            KeyCode::Enter if modifiers.is_empty() => self.send_chat_input(&id),
+            KeyCode::Enter if modifiers == KeyModifiers::ALT => {
+                self.chat_input(&id).insert_newline()
             }
-            KeyCode::Enter => {
-                let content = self.chat_inputs.get(&id).cloned().unwrap_or_default();
-                if content.trim() == "" {
-                    return Ok(());
-                }
-                match self.rt.send_agent_message(&id, content) {
-                    Ok(_) => {
-                        self.chat_inputs.remove(&id);
-                    }
-                    Err(err) => self.status_message = Some(err.to_string()),
-                }
+            KeyCode::Char('j') if modifiers == KeyModifiers::CONTROL => {
+                self.chat_input(&id).insert_newline()
             }
-            KeyCode::Char(c) => {
-                self.chat_inputs.entry(id).or_default().push(c);
+            KeyCode::Left => self.chat_input(&id).move_left(),
+            KeyCode::Right => self.chat_input(&id).move_right(),
+            KeyCode::Up => self.chat_input(&id).move_up(width),
+            KeyCode::Down => self.chat_input(&id).move_down(width),
+            KeyCode::Home => self.chat_input(&id).home(),
+            KeyCode::End => self.chat_input(&id).end(),
+            KeyCode::Backspace => self.chat_input(&id).backspace(),
+            KeyCode::Delete => self.chat_input(&id).delete(),
+            KeyCode::Char(c)
+                if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.chat_input(&id).insert_char(c)
             }
             _ => {}
         }
         Ok(())
+    }
+
+    fn chat_input(&mut self, id: &str) -> &mut ChatInput {
+        self.chat_inputs.entry(id.to_string()).or_default()
+    }
+
+    fn send_chat_input(&mut self, id: &str) {
+        let content = self
+            .chat_inputs
+            .get(id)
+            .map(|input| input.text().to_string())
+            .unwrap_or_default();
+        if content.trim() == "" {
+            return;
+        }
+        if content.trim() == CLEAR_COMMAND {
+            self.clear_session(id);
+            return;
+        }
+        match self.rt.send_agent_message(id, content) {
+            Ok(_) => {
+                self.chat_inputs.remove(id);
+                self.chat_scroll.remove(id);
+            }
+            Err(err) => self.status_message = Some(err.to_string()),
+        }
+    }
+
+    /// Only the wheel does anything; clicks are reported too but ignored.
+    fn handle_mouse(&mut self, mouse: MouseEvent) {
+        let delta = match mouse.kind {
+            MouseEventKind::ScrollUp => -(WHEEL_LINES as isize),
+            MouseEventKind::ScrollDown => WHEEL_LINES as isize,
+            _ => return,
+        };
+        let at = Position::new(mouse.column, mouse.row);
+        if self.detail_tab == DetailTab::Memories {
+            if let Some(view) = self.selected_memories() {
+                if view.reader().is_some_and(|reader| reader.area.contains(at)) {
+                    view.scroll_by(delta);
+                }
+            }
+            return;
+        }
+        let Some(view) = self.selected_chat_view() else {
+            return;
+        };
+        if view.transcript_area.contains(at) {
+            self.scroll_chat(&view, delta);
+        }
+    }
+
+    /// A paste outside the chat would otherwise run as a string of key
+    /// commands, so it goes nowhere.
+    fn handle_paste(&mut self, text: &str) {
+        if self.focus() != Focus::Chat {
+            return;
+        }
+        if let Some(id) = self.selected_agent_id() {
+            self.chat_input(&id).insert_str(text);
+        }
+    }
+
+    /// Scrolls the selected agent's transcript by a page, `direction` being
+    /// negative to go back.
+    fn page_chat(&mut self, direction: isize) {
+        if let Some(view) = self.selected_chat_view() {
+            let lines = scroll::page_lines(view.height) as isize;
+            self.scroll_chat(&view, direction * lines);
+        }
+    }
+
+    fn scroll_chat(&mut self, view: &ChatView, delta: isize) {
+        let state = self
+            .chat_scroll
+            .get(&view.agent_id)
+            .copied()
+            .unwrap_or_default();
+        match scroll::scrolled(state, delta, view.max_top) {
+            ChatScroll::Follow => {
+                self.chat_scroll.remove(&view.agent_id);
+            }
+            top => {
+                self.chat_scroll.insert(view.agent_id.clone(), top);
+            }
+        }
+    }
+
+    /// The last drawn chat, if it is the selected agent's. Another agent may
+    /// have been selected since, and its chat isn't on screen yet.
+    fn selected_chat_view(&self) -> Option<ChatView> {
+        let view = self.chat_view.as_ref()?;
+        (Some(&view.agent_id) == self.selected_agent_id().as_ref()).then(|| view.clone())
+    }
+
+    /// `/clear` ends the session rather than going to the model as a message.
+    fn clear_session(&mut self, id: &str) {
+        match self.rt.clear_agent_session(id) {
+            Ok(outcome) => {
+                self.chat_inputs.remove(id);
+                self.chat_scroll.remove(id);
+                self.info_message = Some(match outcome {
+                    ClearOutcome::Cleared => "session cleared".into(),
+                    ClearOutcome::Queued => "clear queued — runs when this turn ends".into(),
+                });
+            }
+            Err(err) => self.status_message = Some(err.to_string()),
+        }
     }
 
     /// Move the agent table selection by `offset` rows, clamped to the
@@ -273,9 +640,11 @@ impl TUIApp {
     }
 
     fn focus(&self) -> Focus {
-        let started = self
-            .selected_agent()
-            .is_some_and(|agent| agent.state().started());
+        let selected = self.selected_agent();
+        if self.memories_focused && self.detail_tab == DetailTab::Memories && selected.is_some() {
+            return Focus::Memories;
+        }
+        let started = selected.is_some_and(|agent| agent.state().started());
         if self.chat_focused && started {
             Focus::Chat
         } else {
@@ -287,7 +656,12 @@ impl TUIApp {
     //////////////////////////////////////
 
     pub fn draw(&mut self, frame: &mut Frame) {
-        let instructions = Line::from(Self::instruction_spans(self.focus(), self.enter_label()));
+        self.refresh_memories();
+        let instructions = Line::from(Self::instruction_spans(
+            self.focus(),
+            self.enter_label(),
+            self.detail_tab,
+        ));
         let block = Block::default()
             .padding(Padding::top(1))
             .title_bottom(instructions.centered());
@@ -314,6 +688,9 @@ impl TUIApp {
 
     /// What `<Enter>` does to the selected agent, for the key hints.
     fn enter_label(&self) -> &'static str {
+        if self.detail_tab == DetailTab::Memories {
+            return "Browse Memories";
+        }
         let Some(definition) = self.selected_agent() else {
             return "Run Agent";
         };
@@ -329,17 +706,39 @@ impl TUIApp {
 
     /// The key hints along the bottom, which follow whatever has focus.
     /// `enter_label` says what `<Enter>` does to the selected agent.
-    fn instruction_spans(focus: Focus, enter_label: &'static str) -> Vec<Span<'static>> {
+    fn instruction_spans(
+        focus: Focus,
+        enter_label: &'static str,
+        tab: DetailTab,
+    ) -> Vec<Span<'static>> {
+        let other_tab = match tab {
+            DetailTab::Session => "Memories",
+            DetailTab::Memories => "Session",
+        };
         let pairs: Vec<(&str, &str)> = match focus {
             Focus::Agents => vec![
                 ("Quit", " <Q>"),
                 ("Move", " <↑/↓>"),
                 (enter_label, " <Enter>"),
+                (other_tab, " <Tab>"),
                 ("Reload", " <R>"),
             ],
             Focus::Chat => vec![
                 ("Send", " <Enter>"),
+                ("Newline", " <Alt+Enter>"),
+                ("Scroll", " <PgUp/PgDn>"),
+                ("New Session", " /clear"),
+                ("Memories", " <Tab>"),
                 ("Leave Chat", " <Esc>"),
+                ("Quit", " <Ctrl+C>"),
+            ],
+            Focus::Memories => vec![
+                ("Move", " <↑/↓>"),
+                ("Scroll", " <PgUp/PgDn>"),
+                ("Delete", " <D>"),
+                ("Reload", " <R>"),
+                ("Session", " <Tab>"),
+                ("Back", " <Esc>"),
                 ("Quit", " <Ctrl+C>"),
             ],
         };
@@ -426,23 +825,29 @@ impl TUIApp {
                     ]),
                     Line::from(vec![Span::from("  "), config.model_label().into()]).cyan(),
                     Self::context_usage_line(context_used, CONTEXT_LIMIT_TOKENS, detail_width),
+                    Self::agent_cost_line(agent_definition, detail_width),
                 ])])
-                .height(3)
+                .height(4)
             })
             .collect();
 
         // create and render table
-        let table = Table::new(rows, [Constraint::Fill(1)])
-            .column_spacing(1)
-            // subtle slate wash so the cyan row text stays readable
-            .row_highlight_style(Style::default().bg(Color::Rgb(45, 55, 72)))
-            .highlight_symbol(Text::from(vec![">".bold().cyan().into()]))
-            .highlight_spacing(HighlightSpacing::Always);
+        let table = Self::selection_table(rows);
 
         frame.render_widget(block, area);
         frame.render_stateful_widget(table, table_area, &mut self.agents_table_state);
 
         Ok(())
+    }
+
+    /// A one column list whose selected row is marked and highlighted.
+    fn selection_table(rows: Vec<Row<'_>>) -> Table<'_> {
+        Table::new(rows, [Constraint::Fill(1)])
+            .column_spacing(1)
+            // subtle slate wash so the cyan row text stays readable
+            .row_highlight_style(Style::default().bg(Color::Rgb(45, 55, 72)))
+            .highlight_symbol(Text::from(vec![">".bold().cyan().into()]))
+            .highlight_spacing(HighlightSpacing::Always)
     }
 
     /// The color the status dot takes for each agent state.
@@ -492,6 +897,144 @@ impl TUIApp {
         ])
     }
 
+    /// What the agent's chat and memory have cost. Totals kept in the memory
+    /// database show `…` until they have been read.
+    fn agent_cost_line(definition: &AgentDefinition, width: usize) -> Line<'static> {
+        let memory = definition.memory_view();
+        let (all, mem) = if memory.loaded {
+            (
+                Some(definition.all_sessions_spend()),
+                Some(memory.memory_spend()),
+            )
+        } else {
+            (None, None)
+        };
+        Self::cost_line(definition.session_spend(), all, mem, width)
+    }
+
+    /// `sess $0.04 all $0.42 mem $0.03`, cut to `width` when it cannot fit.
+    pub(super) fn cost_line(
+        session: Spend,
+        all: Option<Spend>,
+        mem: Option<Spend>,
+        width: usize,
+    ) -> Line<'static> {
+        let figure = |spend: Option<Spend>| {
+            spend
+                .map(|spend| Self::compact_cost(&spend))
+                .unwrap_or_else(|| "…".to_string())
+        };
+        let parts = [
+            ("sess", figure(Some(session))),
+            ("all", figure(all)),
+            ("mem", figure(mem)),
+        ];
+        let plain = parts
+            .iter()
+            .map(|(label, value)| format!("{} {}", label, value))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let length = plain.chars().count();
+        if length > width {
+            return Line::from(Self::one_line(&plain, width)).dark_gray();
+        }
+
+        let mut spans = Vec::new();
+        if length < width {
+            spans.push(Span::from(" "));
+        }
+        for (index, (label, value)) in parts.into_iter().enumerate() {
+            let gap = if index == 0 { "" } else { " " };
+            spans.push(Span::from(format!("{}{} ", gap, label)).dark_gray());
+            spans.push(Span::from(value).cyan());
+        }
+        Line::from(spans)
+    }
+
+    /// A cost in at most [`COMPACT_COST_WIDTH`] characters, losing precision
+    /// as it grows. `~` marks a total some responses left unpriced.
+    pub(super) fn compact_cost(spend: &Spend) -> String {
+        let nanos = i128::from(spend.cost_nanos.max(0));
+        if spend.unpriced > 0 && nanos == 0 {
+            return "—".to_string();
+        }
+        let prefix = if spend.unpriced > 0 { "~" } else { "" };
+        if nanos == 0 {
+            return "$0".to_string();
+        }
+
+        // each tier is a unit in nanodollars and the decimals shown in it
+        const TIERS: [(i128, u32, &str); 6] = [
+            (1_000_000_000, 2, ""),
+            (1_000_000_000, 1, ""),
+            (1_000_000_000, 0, ""),
+            (1_000_000_000_000, 0, "k"),
+            (1_000_000_000_000_000, 0, "M"),
+            (1_000_000_000_000_000_000, 0, "B"),
+        ];
+        for (unit, decimals, suffix) in TIERS {
+            let step = unit / 10i128.pow(decimals);
+            let rounded = (nanos + step / 2) / step;
+            if rounded == 0 {
+                continue;
+            }
+            let scale = 10i128.pow(decimals);
+            let (whole, fraction) = (rounded / scale, rounded % scale);
+            let number = match (decimals, whole) {
+                (0, _) => whole.to_string(),
+                // below a dollar the leading zero is the first thing to go
+                (_, 0) => format!(".{:0width$}", fraction, width = decimals as usize),
+                _ => format!("{}.{:0width$}", whole, fraction, width = decimals as usize),
+            };
+            let candidates = if decimals > 0 && whole == 0 {
+                vec![
+                    format!("{}$0{}", prefix, number),
+                    format!("{}${}", prefix, number),
+                ]
+            } else {
+                vec![format!("{}${}{}", prefix, number, suffix)]
+            };
+            if let Some(text) = candidates
+                .into_iter()
+                .find(|text| text.chars().count() <= COMPACT_COST_WIDTH)
+            {
+                return text;
+            }
+        }
+        // under a cent: too small to show, and too small to matter when partial
+        if spend.unpriced > 0 {
+            "~$0".to_string()
+        } else {
+            "<$.01".to_string()
+        }
+    }
+
+    /// A cost for the detail pane, with more precision the smaller it is.
+    pub(super) fn human_cost(spend: &Spend) -> String {
+        let nanos = i128::from(spend.cost_nanos.max(0));
+        if spend.unpriced > 0 && nanos == 0 {
+            return "—".to_string();
+        }
+        let prefix = if spend.unpriced > 0 { "~" } else { "" };
+        let text = if nanos == 0 {
+            "$0".to_string()
+        } else if nanos < 100_000 {
+            "<$0.0001".to_string()
+        } else {
+            // the precision is picked after rounding, so 0.009996 reads $0.01
+            let ten_thousandths = (nanos + 50_000) / 100_000;
+            let cents = (nanos + 5_000_000) / 10_000_000;
+            if ten_thousandths < 100 {
+                format!("$0.{:04}", ten_thousandths)
+            } else if cents < 10_000 {
+                format!("${}.{:02}", cents / 100, cents % 100)
+            } else {
+                format!("${}", (nanos + 500_000_000) / 1_000_000_000)
+            }
+        };
+        format!("{}{}", prefix, text)
+    }
+
     /// Format a token count compactly: 950 -> "950", 24_000 -> "24k", 1_000_000 -> "1M"
     fn human_tokens(tokens: u64) -> String {
         match tokens {
@@ -515,6 +1058,7 @@ impl TUIApp {
             .border_style(Style::default().cyan());
         let inner = block.inner(area);
         frame.render_widget(block, area);
+        self.chat_view = None;
 
         let Some(definition) = self.selected_agent() else {
             let project_dir = self.rt.config().project_dir();
@@ -536,33 +1080,176 @@ impl TUIApp {
             return Ok(());
         };
 
-        let status_height = if self.status_message.is_some() { 2 } else { 0 };
+        let confirm_delete = self
+            .memories
+            .as_ref()
+            .and_then(|view| view.confirm_delete())
+            .cloned();
+        let status_height = if confirm_delete.is_some()
+            || self.status_message.is_some()
+            || self.info_message.is_some()
+        {
+            2
+        } else {
+            0
+        };
         let config_lines = self.config_lines(&definition);
         let layout = Layout::vertical([
             Constraint::Length(config_lines.len() as u16 + 1),
+            Constraint::Length(1),
             Constraint::Fill(1),
             Constraint::Length(status_height),
         ]);
-        let [config_area, body_area, status_area] = layout.areas(inner);
+        let [config_area, tab_area, body_area, status_area] = layout.areas(inner);
 
         // render top info area
         frame.render_widget(Paragraph::new(config_lines), config_area);
+        self.render_tabs(&definition, tab_area, frame);
 
-        // render configuration or session
-        match definition.state() {
-            AgentState::Configuring => self.render_configuring(&definition, body_area, frame),
+        // render configuration, session or memories
+        match (self.detail_tab, definition.state()) {
+            (DetailTab::Memories, _) => self.render_memories(body_area, frame),
+            (_, AgentState::Configuring) => self.render_configuring(&definition, body_area, frame),
             _ => self.render_session(&definition, body_area, frame),
         }
 
         // render status message
-        if let Some(status) = &self.status_message {
+        if let Some(pending) = confirm_delete {
+            frame.render_widget(
+                Paragraph::new(
+                    Line::from(format!(
+                        "Delete skill `{}`? <y> to delete, any other key cancels",
+                        pending.name
+                    ))
+                    .yellow(),
+                )
+                .wrap(Wrap::default()),
+                status_area,
+            );
+        } else if let Some(status) = &self.status_message {
             frame.render_widget(
                 Paragraph::new(Line::from(status.clone()).red()).wrap(Wrap::default()),
+                status_area,
+            );
+        } else if let Some(info) = &self.info_message {
+            frame.render_widget(
+                Paragraph::new(Line::from(info.clone()).dark_gray()).wrap(Wrap::default()),
                 status_area,
             );
         }
 
         Ok(())
+    }
+
+    /// `Setup` or `Session`, then `Memories (N)`. The tab showing is underlined
+    /// while its window has focus.
+    fn render_tabs(&self, definition: &AgentDefinition, area: Rect, frame: &mut Frame) {
+        let first = match definition.state() {
+            AgentState::Configuring => "Setup".to_string(),
+            _ => "Session".to_string(),
+        };
+        let memories = match definition.memory_view().skills {
+            Some(count) => format!("Memories ({})", count),
+            None => "Memories".to_string(),
+        };
+        let focus = self.focus();
+        let (selected, focused) = match self.detail_tab {
+            DetailTab::Session => (0, focus == Focus::Chat),
+            DetailTab::Memories => (1, focus == Focus::Memories),
+        };
+        let mut highlight = Style::default().bold().cyan();
+        if focused {
+            highlight = highlight.underlined();
+        }
+        let tabs = Tabs::new(vec![first, memories])
+            .select(selected)
+            .style(Style::default().dark_gray())
+            .highlight_style(highlight);
+        frame.render_widget(tabs, area);
+    }
+
+    /// The selected agent's skills on the left and the open one on the right.
+    fn render_memories(&mut self, area: Rect, frame: &mut Frame) {
+        let focused = self.focus() == Focus::Memories;
+        let Some(view) = self.memories.as_mut() else {
+            frame.render_widget(Paragraph::new(Line::from("Loading…").dark_gray()), area);
+            return;
+        };
+        if view.skills().is_empty() {
+            view.set_reader(None);
+            let hint = Paragraph::new(vec![
+                Line::from("No memories yet.").dark_gray(),
+                Line::from(""),
+                Line::from(
+                    "Skills the memory writer saves from this agent's sessions show up here.",
+                )
+                .dark_gray(),
+            ])
+            .wrap(Wrap::default());
+            frame.render_widget(hint, area);
+            return;
+        }
+
+        let [list_area, reader_area] =
+            Layout::horizontal([Constraint::Percentage(35), Constraint::Percentage(65)])
+                .areas(area);
+        let border = if focused {
+            Style::default().cyan()
+        } else {
+            Style::default().dark_gray()
+        };
+
+        let list_block = Block::bordered()
+            .title(" Skills ")
+            .border_set(border::ROUNDED)
+            .border_style(border);
+        let table_area = list_block.inner(list_area);
+        // the highlight symbol and the column spacing sit to the left of the cell
+        let row_width = table_area.width.saturating_sub(2) as usize;
+        let rows: Vec<Row> = memories::list_rows(view.skills(), row_width, unix_now())
+            .into_iter()
+            .map(|lines| Row::new(vec![Cell::from(Vec::from(lines))]).height(2))
+            .collect();
+        let table = Self::selection_table(rows);
+        frame.render_widget(list_block, list_area);
+        frame.render_stateful_widget(table, table_area, &mut view.table_state);
+
+        let title = view
+            .selected()
+            .map(|skill| {
+                let room = (reader_area.width as usize).saturating_sub(4);
+                format!(" {} ", memories::fit_width(&skill.name, room))
+            })
+            .unwrap_or_default();
+        let reader_block = Block::bordered()
+            .title(Line::from(title).bold().cyan())
+            .border_set(border::ROUNDED)
+            .border_style(border);
+        let inner = reader_block.inner(reader_area);
+        frame.render_widget(reader_block, reader_area);
+
+        let height = inner.height as usize;
+        let top = view.top();
+        let lines = view.reader_lines(inner.width as usize);
+        let total = lines.len();
+        let max_top = total.saturating_sub(height);
+        let top = top.min(max_top);
+        let mut shown: Vec<Line> = lines.iter().skip(top).take(height).cloned().collect();
+        if top < max_top && height >= 2 {
+            shown.pop();
+            let hidden = total - (top + shown.len());
+            shown.push(
+                Line::from(format!("↓ {} more lines — PgDn or scroll down", hidden))
+                    .dark_gray()
+                    .italic(),
+            );
+        }
+        frame.render_widget(Paragraph::new(shown), inner);
+        view.set_reader(Some(ReaderView {
+            area: reader_area,
+            max_top,
+            height,
+        }));
     }
 
     /// The agent's configuration, shown above whatever the detail window is
@@ -585,7 +1272,7 @@ impl TUIApp {
             names.join(", ")
         };
 
-        vec![
+        let mut lines = vec![
             // the name is the directory the agent was loaded from, which is
             // also its id, so there is nothing else worth putting here
             Line::from(Span::from(config.name()).bold().cyan()),
@@ -609,7 +1296,96 @@ impl TUIApp {
                 Span::from("State:     ").dark_gray(),
                 Span::from(state.label()).style(Style::default().fg(Self::state_color(&state))),
             ]),
-        ]
+        ];
+        lines.extend(Self::memory_lines(
+            &definition.memory_view(),
+            config.memory().skills.is_some(),
+        ));
+        lines
+    }
+
+    /// The `Memory:` line, the newest job's, and any error, shown under `State:`.
+    pub(super) fn memory_lines(view: &MemoryView, skills_on: bool) -> Vec<Line<'static>> {
+        let labelled = |label: &'static str, text: String| {
+            Line::from(vec![Span::from(label).dark_gray(), Span::from(text).blue()])
+        };
+        let mut lines = Vec::new();
+        if skills_on {
+            let skills = match view.skills {
+                Some(count) => format!("{} {}", count, plural(count, "skill")),
+                None => "…".to_string(),
+            };
+            lines.push(labelled(
+                "Memory:    ",
+                format!("{} · {}", skills, Self::jobs_summary(view)),
+            ));
+            lines.push(labelled(
+                "Last job:  ",
+                Self::job_summary(view.last_job.as_ref()),
+            ));
+        } else {
+            lines.push(labelled("Memory:    ", "skills off".to_string()));
+            if view.last_job.is_some() {
+                lines.push(labelled(
+                    "Last job:  ",
+                    Self::job_summary(view.last_job.as_ref()),
+                ));
+            }
+        }
+        if let Some(message) = &view.message {
+            lines.push(Line::from(vec![
+                Span::from("Status:    ").dark_gray(),
+                Span::from(message.clone()).red(),
+            ]));
+        }
+        lines
+    }
+
+    /// How many sessions are being or waiting to be analysed. After a failure
+    /// the writer stops, so the rest wait for the next `/clear`.
+    fn jobs_summary(view: &MemoryView) -> String {
+        let pending = view.pending.unwrap_or(0);
+        if view.stalled() && pending > 0 {
+            return format!(
+                "{} {} pending (retries on next {})",
+                pending,
+                plural(pending, "job"),
+                CLEAR_COMMAND
+            );
+        }
+        match pending + usize::from(view.job_running()) {
+            0 => "no jobs running".to_string(),
+            count => format!("{} {} running", count, plural(count, "job")),
+        }
+    }
+
+    /// `session #7 · added 2 skills · 14k tok · $0.0031`, or `none yet`.
+    pub(super) fn job_summary(job: Option<&MemoryJob>) -> String {
+        let Some(job) = job else {
+            return "none yet".to_string();
+        };
+        let state = match &job.state {
+            JobState::Running => "analysing".to_string(),
+            JobState::Done { skills } => Self::skills_summary(skills),
+            JobState::Failed(err) => format!("failed: {}", Self::one_line(err, usize::MAX)),
+            JobState::Interrupted => "interrupted".to_string(),
+        };
+        format!(
+            "session #{} · {} · {} tok · {}",
+            job.session_id,
+            state,
+            Self::human_tokens(job.spend.tokens),
+            Self::human_cost(&job.spend)
+        )
+    }
+
+    fn skills_summary(skills: &SkillsSaved) -> String {
+        match (skills.added, skills.updated) {
+            (0, 0) => "saved 0 skills".to_string(),
+            (added, 0) => format!("added {} {}", added, plural(added, "skill")),
+            (0, updated) => format!("updated {} {}", updated, plural(updated, "skill")),
+            (added, updated) => format!("added {} · updated {}", added, updated),
+        }
     }
 
     fn render_configuring(&mut self, definition: &AgentDefinition, area: Rect, frame: &mut Frame) {
@@ -678,7 +1454,20 @@ impl TUIApp {
     /// The running agent's chat session: the transcript with an input box
     /// underneath it.
     fn render_session(&mut self, definition: &AgentDefinition, area: Rect, frame: &mut Frame) {
-        let layout = Layout::vertical([Constraint::Fill(1), Constraint::Length(3)]);
+        let id = definition.id();
+        let focused = self.focus() == Focus::Chat;
+
+        // one column is kept free so the cursor has somewhere to sit at the end
+        // of a full row
+        let input_width = (area.width.saturating_sub(2) as usize)
+            .saturating_sub(1)
+            .max(1);
+        let window = self.chat_input(&id).window(input_width, INPUT_MAX_ROWS);
+
+        let layout = Layout::vertical([
+            Constraint::Fill(1),
+            Constraint::Length(window.lines.len() as u16 + 2),
+        ]);
         let [transcript_area, input_area] = layout.areas(area);
 
         let width = transcript_area.width.max(1) as usize;
@@ -704,19 +1493,56 @@ impl TUIApp {
         if let AgentState::Failed(err) = definition.state() {
             lines.push(Line::from(format!("error: {}", err)).red());
         }
+        // a clear waits for the turn to end, and what is sent meanwhile opens
+        // the session after it
+        if definition.clear_pending() {
+            lines.push(Line::from(""));
+            lines.push(
+                Line::from("── clear queued — runs when this turn ends ──")
+                    .yellow()
+                    .italic(),
+            );
+            if !definition.next_session_messages().is_empty() {
+                lines.push(Line::from("next session").yellow().bold());
+                for message in definition.next_session_messages() {
+                    lines.extend(Self::message_lines(message, width, false));
+                }
+            }
+        }
 
-        // keep the newest output on screen
         let height = transcript_area.height as usize;
-        let scroll = lines.len().saturating_sub(height) as u16;
-        frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), transcript_area);
+        let total = lines.len();
+        let max_top = total.saturating_sub(height);
+        // a transcript that shrank under a held position follows again
+        let state = match self.chat_scroll.get(&id).copied() {
+            Some(ChatScroll::Top(top)) if top < max_top => ChatScroll::Top(top),
+            _ => {
+                self.chat_scroll.remove(&id);
+                ChatScroll::Follow
+            }
+        };
+        let top = scroll::visible_top(state, max_top);
+        let mut shown: Vec<Line> = lines.into_iter().skip(top).take(height).collect();
+        if top < max_top && height >= 2 {
+            shown.pop();
+            let hidden = total - (top + shown.len());
+            shown.push(
+                Line::from(format!("↓ {} more lines — PgDn or scroll down", hidden))
+                    .dark_gray()
+                    .italic(),
+            );
+        }
+        frame.render_widget(Paragraph::new(shown), transcript_area);
 
-        let focused = self.focus() == Focus::Chat;
-        let input = self
-            .chat_inputs
-            .get(&definition.id())
-            .cloned()
-            .unwrap_or_default();
-        let input_block = Block::bordered()
+        self.chat_view = Some(ChatView {
+            agent_id: id,
+            transcript_area,
+            max_top,
+            height,
+            input_width,
+        });
+
+        let mut input_block = Block::bordered()
             .border_set(border::ROUNDED)
             .border_style(if focused {
                 Style::default().cyan()
@@ -729,12 +1555,38 @@ impl TUIApp {
                 " <Enter> to chat "
             });
 
-        let text = if focused {
-            Line::from(vec![Span::from(input), Span::from("▏").cyan()])
+        if focused && (window.hidden_above || window.hidden_below) {
+            let arrows = match (window.hidden_above, window.hidden_below) {
+                (true, true) => " ↑↓ ",
+                (true, false) => " ↑ ",
+                _ => " ↓ ",
+            };
+            input_block = input_block.title_top(Line::from(arrows).dark_gray().right_aligned());
+        }
+        let inner = input_block.inner(input_area);
+
+        let style = if focused {
+            Style::default()
         } else {
-            Line::from(input).dark_gray()
+            Style::default().dark_gray()
         };
+        let text: Vec<Line> = window
+            .lines
+            .into_iter()
+            .map(|line| Line::from(line).style(style))
+            .collect();
         frame.render_widget(Paragraph::new(text).block(input_block), input_area);
+
+        // an area too small to hold the box has nowhere to put the cursor
+        if focused
+            && window.cursor_row < inner.height as usize
+            && window.cursor_col < inner.width as usize
+        {
+            frame.set_cursor_position(Position::new(
+                inner.x + window.cursor_col as u16,
+                inner.y + window.cursor_row as u16,
+            ));
+        }
     }
 
     /// One message rendered as a labeled block, hard wrapped to `width` so the
@@ -871,5 +1723,20 @@ impl TUIApp {
             }
         }
         out
+    }
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn plural(count: usize, noun: &str) -> String {
+    if count == 1 {
+        noun.to_string()
+    } else {
+        format!("{}s", noun)
     }
 }

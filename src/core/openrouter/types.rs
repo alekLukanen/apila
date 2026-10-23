@@ -395,6 +395,66 @@ pub struct Usage {
     pub completion_tokens: u32,
     #[serde(default)]
     pub total_tokens: u32,
+    /// What OpenRouter charged in dollars, absent when it did not say.
+    #[serde(default)]
+    pub cost: Option<f64>,
+}
+
+/// Tokens and dollars summed over many responses. Dollars are kept as whole
+/// nanodollars so totals add exactly and store as integers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Spend {
+    pub tokens: u64,
+    pub cost_nanos: i64,
+    /// Responses that came back without a cost.
+    pub unpriced: u32,
+}
+
+impl Spend {
+    pub fn new(tokens: u64, cost_nanos: i64, unpriced: u32) -> Spend {
+        Spend {
+            tokens,
+            cost_nanos,
+            unpriced,
+        }
+    }
+
+    /// Adds one response; a missing usage or cost counts it as unpriced.
+    pub fn add_response(&mut self, usage: Option<&Usage>) -> &mut Spend {
+        let Some(usage) = usage else {
+            self.unpriced = self.unpriced.saturating_add(1);
+            return self;
+        };
+        self.tokens = self.tokens.saturating_add(u64::from(usage.total_tokens));
+        match usage.cost {
+            Some(cost) if cost.is_finite() => {
+                self.cost_nanos = self.cost_nanos.saturating_add(cost_to_nanos(cost));
+            }
+            _ => self.unpriced = self.unpriced.saturating_add(1),
+        }
+        self
+    }
+
+    pub fn merge(&mut self, other: &Spend) -> &mut Spend {
+        self.tokens = self.tokens.saturating_add(other.tokens);
+        self.cost_nanos = self.cost_nanos.saturating_add(other.cost_nanos);
+        self.unpriced = self.unpriced.saturating_add(other.unpriced);
+        self
+    }
+
+    pub fn cost_usd(&self) -> f64 {
+        self.cost_nanos as f64 / 1e9
+    }
+
+    /// Whether every response counted carried a cost.
+    pub fn priced(&self) -> bool {
+        self.unpriced == 0
+    }
+}
+
+/// The cast saturates, so an absurd cost pins to the limit rather than wrapping.
+fn cost_to_nanos(cost: f64) -> i64 {
+    (cost * 1e9).round() as i64
 }
 
 /// The body returned alongside a non 2xx status.
@@ -410,4 +470,55 @@ pub struct ApiError {
     pub message: String,
     #[serde(default)]
     pub metadata: Option<serde_json::Value>,
+}
+
+// Embeddings ////////////////////////
+//////////////////////////////////////
+
+/// A request to `/embeddings`, one vector per entry of `input`.
+#[derive(Debug, Clone, Serialize)]
+pub struct EmbeddingRequest {
+    pub model: String,
+    pub input: Vec<String>,
+}
+
+impl EmbeddingRequest {
+    pub fn new(model: impl Into<String>, input: Vec<String>) -> EmbeddingRequest {
+        EmbeddingRequest {
+            model: model.into(),
+            input,
+        }
+    }
+
+    /// Catches a request the api would refuse before it costs a round trip.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.model.trim() == "" {
+            return Err("model must not be empty".into());
+        }
+        if self.input.is_empty() {
+            return Err("input must contain at least one text".into());
+        }
+        if self.input.iter().any(|text| text.trim() == "") {
+            return Err("input must not contain an empty text".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EmbeddingResponse {
+    #[serde(default)]
+    pub data: Vec<EmbeddingData>,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub usage: Option<Usage>,
+}
+
+/// One input's vector. `index` is its position in the request's `input`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct EmbeddingData {
+    #[serde(default)]
+    pub index: usize,
+    pub embedding: Vec<f32>,
 }

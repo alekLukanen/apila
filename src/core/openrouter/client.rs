@@ -5,7 +5,10 @@ use thiserror::Error;
 
 use crate::core::config::config::Config;
 
-use super::types::{ApiErrorBody, ChatCompletionRequest, ChatCompletionResponse};
+use super::types::{
+    ApiErrorBody, ChatCompletionRequest, ChatCompletionResponse, EmbeddingRequest,
+    EmbeddingResponse,
+};
 
 pub const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
 pub const DEFAULT_TIMEOUT_SECS: u64 = 60;
@@ -29,6 +32,12 @@ pub enum OpenRouterError {
 
     #[error("the response contained no choices")]
     NoChoices,
+
+    #[error("the response contained no embeddings")]
+    NoEmbeddings,
+
+    #[error("the response contained an unusable embedding: {0}")]
+    InvalidEmbedding(String),
 }
 
 #[derive(Clone)]
@@ -132,10 +141,41 @@ impl OpenRouter {
     ) -> Result<ChatCompletionResponse, OpenRouterError> {
         req.validate().map_err(OpenRouterError::InvalidRequest)?;
 
-        let url = format!(
-            "{}/chat/completions",
-            self.config.base_url.trim_end_matches('/')
-        );
+        let body = self.post_json("chat/completions", &req)?;
+        let resp: ChatCompletionResponse = serde_json::from_str(&body)?;
+        if resp.choices.is_empty() {
+            return Err(OpenRouterError::NoChoices);
+        }
+
+        Ok(resp)
+    }
+
+    // Embedding operations //////////////
+    //////////////////////////////////////
+
+    /// One vector per input, in the order of `req.input` whatever order the
+    /// api listed them in.
+    pub fn embeddings(&self, req: EmbeddingRequest) -> Result<EmbeddingResponse, OpenRouterError> {
+        req.validate().map_err(OpenRouterError::InvalidRequest)?;
+
+        let body = self.post_json("embeddings", &req)?;
+        let mut resp: EmbeddingResponse = serde_json::from_str(&body)?;
+        if resp.data.is_empty() {
+            return Err(OpenRouterError::NoEmbeddings);
+        }
+        resp.data.sort_by_key(|data| data.index);
+        check_embeddings(&resp, req.input.len()).map_err(OpenRouterError::InvalidEmbedding)?;
+
+        Ok(resp)
+    }
+
+    /// Posts `req` to `{base_url}/{path}` and returns the body of a 2xx reply.
+    fn post_json(
+        &self,
+        path: &str,
+        req: &impl serde::Serialize,
+    ) -> Result<String, OpenRouterError> {
+        let url = format!("{}/{}", self.config.base_url.trim_end_matches('/'), path);
 
         let mut builder = self
             .http
@@ -149,7 +189,7 @@ impl OpenRouter {
             builder = builder.header("X-OpenRouter-Title", x_title);
         }
 
-        let resp = builder.json(&req).send()?;
+        let resp = builder.json(req).send()?;
 
         // The body carries the useful error message, so it is read as text
         // rather than thrown away by `error_for_status`.
@@ -166,11 +206,39 @@ impl OpenRouter {
             });
         }
 
-        let resp: ChatCompletionResponse = serde_json::from_str(&body)?;
-        if resp.choices.is_empty() {
-            return Err(OpenRouterError::NoChoices);
-        }
-
-        Ok(resp)
+        Ok(body)
     }
+}
+
+/// A vector that is empty, not finite or all zeros has no direction, so no
+/// similarity could ever be measured against it.
+fn check_embeddings(resp: &EmbeddingResponse, inputs: usize) -> Result<(), String> {
+    if resp.data.len() != inputs {
+        return Err(format!(
+            "{} inputs were sent and {} vectors came back",
+            inputs,
+            resp.data.len()
+        ));
+    }
+    let dimensions = resp.data[0].embedding.len();
+    for (position, data) in resp.data.iter().enumerate() {
+        // sorted by index, so anything else is an input left out or repeated
+        if data.index != position {
+            return Err(format!("no vector came back for input {}", position));
+        }
+        let vector = &data.embedding;
+        if vector.is_empty() {
+            return Err("a vector is empty".into());
+        }
+        if vector.len() != dimensions {
+            return Err("the vectors are not all the same length".into());
+        }
+        if vector.iter().any(|value| !value.is_finite()) {
+            return Err("a vector holds a value that is not finite".into());
+        }
+        if vector.iter().all(|value| *value == 0.0) {
+            return Err("a vector is all zeros".into());
+        }
+    }
+    Ok(())
 }

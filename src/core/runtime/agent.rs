@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{
     mpsc::{self, Receiver, Sender, TryRecvError},
     Arc, Mutex, MutexGuard,
@@ -7,9 +7,14 @@ use std::thread;
 
 use thiserror::Error;
 
+use crate::core::memory::recorder::{
+    JobState, MemoryJob, MemoryStatus, MemoryView, Messages, SessionRecorder,
+};
+use crate::core::memory::store::{memory_path, JobRecord, JobStatus, MemoryStore, StoreError};
+use crate::core::memory::writer::{AgentJob, WriterHandle};
 use crate::core::openrouter::client::OpenRouter;
 use crate::core::openrouter::types::{
-    ChatCompletionRequest, Message, Reasoning, ReasoningEffort, ToolChoice, Usage,
+    ChatCompletionRequest, Message, Reasoning, ReasoningEffort, Spend, ToolChoice, Usage,
 };
 use crate::core::runtime::agent_config::{self, AgentConfig, ConfigFiles, ConfigFilesError};
 use crate::core::runtime::helpers::{classify, Turn};
@@ -24,6 +29,9 @@ pub enum AgentError {
 
     #[error("`{name}` could not be read: {error}")]
     ConfigFileUnreadable { name: String, error: String },
+
+    #[error("the agent has not started, so it has no session to clear")]
+    NotStarted,
 }
 
 impl From<ConfigFilesError> for AgentError {
@@ -37,7 +45,8 @@ impl From<ConfigFilesError> for AgentError {
             // file is there and cannot be used, and the message says why
             err @ (ConfigFilesError::InvalidModel(_)
             | ConfigFilesError::InvalidMaxIterations
-            | ConfigFilesError::InvalidTools(_)) => AgentError::ConfigFileUnreadable {
+            | ConfigFilesError::InvalidTools(_)
+            | ConfigFilesError::InvalidMemory(_)) => AgentError::ConfigFileUnreadable {
                 name: agent_config::AGENT_CONFIG_FILE_NAME.into(),
                 error: err.to_string(),
             },
@@ -54,6 +63,15 @@ enum AgentCommand {
     Shutdown,
 }
 
+/// What became of a request to clear the agent's session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClearOutcome {
+    /// The agent was not working, so the new session starts straight away.
+    Cleared,
+    /// The agent is mid turn; the session ends once the turn does.
+    Queued,
+}
+
 /// The thread lives as long as the agent, so a conversation in flight is never
 /// tied to whoever asked for it. Commands go over a channel; state is read
 /// through the mutex.
@@ -67,12 +85,20 @@ pub struct Agent {
 struct AgentInner {
     definition: Mutex<AgentDefinition>,
     openrouter: Arc<OpenRouter>,
+    writer: WriterHandle,
+    /// The sessions this process has ended, whose cost is already counted.
+    ended_sessions: Mutex<Vec<i64>>,
 }
 
 impl Agent {
-    /// `id` is the name of the directory the agent was loaded from, which is
-    /// unique among the project directory's children.
-    pub fn new(id: String, config: AgentConfig, openrouter: Arc<OpenRouter>) -> Agent {
+    /// `id` is the name of the agent's directory, unique in the project.
+    /// `writer` takes its ended sessions and names the recording process.
+    pub fn new(
+        id: String,
+        config: AgentConfig,
+        openrouter: Arc<OpenRouter>,
+        writer: WriterHandle,
+    ) -> Agent {
         let inner = Arc::new(AgentInner {
             definition: Mutex::new(AgentDefinition {
                 id: id.clone(),
@@ -86,8 +112,15 @@ impl Agent {
                 message_queue: Vec::new(),
                 opened_with_directive: false,
                 usage: None,
+                session_spend: Spend::default(),
+                past_sessions: Spend::default(),
+                clear_pending: false,
+                next_session_messages: Vec::new(),
+                memory_status: MemoryStatus::default(),
             }),
             openrouter,
+            writer,
+            ended_sessions: Mutex::new(Vec::new()),
         });
 
         let (commands, receiver) = mpsc::channel();
@@ -135,16 +168,12 @@ impl Agent {
                 return Err(AgentError::ConfigFileMissing(file.name()));
             }
 
-            definition.set_system_prompt(build_system_prompt(&config_files));
-
             // without a directive there is nothing to say yet, so the agent
             // goes idle and the user's first message opens the conversation
-            let Some(directive) = config_files.directive_file().contents() else {
+            if !begin_session(&mut definition, &config_files) {
                 definition.set_state(AgentState::Idle);
                 return Ok(());
-            };
-
-            definition.push_directive(directive.trim());
+            }
             definition.set_state(AgentState::Working);
         }
 
@@ -158,7 +187,12 @@ impl Agent {
     pub fn send_message(&self, content: String) {
         {
             let mut definition = self.definition();
-            if definition.state() == AgentState::Working {
+            // a clear is on its way, so this opens the session after it
+            if definition.clear_pending {
+                definition
+                    .next_session_messages
+                    .push(Message::user(content));
+            } else if definition.state() == AgentState::Working {
                 definition.queue_message(Message::user(content));
             } else {
                 definition.push_message(Message::user(content));
@@ -169,6 +203,26 @@ impl Agent {
         // sent even for a queued message, so a dead thread is noticed here
         // rather than leaving the agent working forever
         self.run();
+    }
+
+    /// Ends the session and starts a new one, the way starting the agent does.
+    /// Mid turn it waits for the turn to end; a second request while one is
+    /// waiting changes nothing.
+    pub fn clear_session(&self) -> Result<ClearOutcome, AgentError> {
+        let outcome = {
+            let mut definition = self.definition();
+            if !definition.state().started() {
+                return Err(AgentError::NotStarted);
+            }
+            definition.clear_pending = true;
+            if definition.state() == AgentState::Working {
+                ClearOutcome::Queued
+            } else {
+                ClearOutcome::Cleared
+            }
+        };
+        self.run();
+        Ok(outcome)
     }
 
     /// Tells the thread there is something to send. The state it works from is
@@ -194,27 +248,168 @@ impl AgentInner {
     /// The agent loop. It sits on the channel until there is something to
     /// send, and goes back to waiting once the model has finished answering.
     fn run(self: Arc<Self>, commands: Receiver<AgentCommand>) {
-        // nothing else can reach these, so tools mutate them without locking,
-        // and whatever a tool opened is closed when this returns
-        let mut states = ToolStates::new();
+        // made on the first command, once the runtime has settled the agent's
+        // directory
+        let mut session: Option<Session> = None;
+        self.load_totals(None);
 
         while let Ok(command) = commands.recv() {
             match command {
                 AgentCommand::Run => {
-                    let shutting_down = self.run_turns(&commands, &mut states);
-                    if shutting_down {
-                        return;
+                    self.load_totals(session.as_ref());
+                    let session = session.get_or_insert_with(|| self.new_session());
+                    if self.on_run(&commands, session) {
+                        break;
                     }
                 }
-                AgentCommand::Shutdown => return,
+                AgentCommand::Shutdown => break,
             }
         }
+
+        // whatever landed since the last sync is kept; the session itself is
+        // left open and ended by the next process
+        if let Some(session) = &mut session {
+            session.recorder.sync(&self.definition);
+        }
+    }
+
+    /// Reads what earlier processes spent from the memory database, until it
+    /// has been read once. A failure is shown and tried again on the next run.
+    fn load_totals(&self, session: Option<&Session>) {
+        let (dir, status) = {
+            let definition = self.definition.lock().expect("mutex error");
+            (definition.config().dir(), definition.memory_status.clone())
+        };
+        if status.loaded() || dir.as_os_str().is_empty() {
+            return;
+        }
+        let mut exclude = self.ended_sessions.lock().expect("mutex error").clone();
+        exclude.extend(session.and_then(|session| session.recorder.session_id()));
+
+        match read_totals(&dir, &exclude, &self.writer.owner()) {
+            Ok(totals) => {
+                let mut definition = self.definition.lock().expect("mutex error");
+                definition.past_sessions.merge(&totals.sessions);
+                status.load(
+                    totals.memory,
+                    totals.skills,
+                    totals.last_job,
+                    Some(totals.pending),
+                );
+                status.clear_prefixed(LOAD_FAILED);
+            }
+            Err(err) => status.set(format!("{}: {}", LOAD_FAILED, err)),
+        }
+    }
+
+    /// Nothing else can reach a session's tool states, so tools mutate them
+    /// without locking, and whatever a tool opened is closed when it drops.
+    fn new_session(&self) -> Session {
+        let (dir, status) = {
+            let definition = self.definition.lock().expect("mutex error");
+            (definition.config().dir(), definition.memory_status.clone())
+        };
+        let mut states = ToolStates::new();
+        states.set_openrouter(Arc::clone(&self.openrouter));
+        Session {
+            states,
+            recorder: SessionRecorder::new(dir, self.writer.owner(), status),
+        }
+    }
+
+    /// Runs whatever the state says is waiting, then any clear asked for while
+    /// it ran. A `Run` with nothing waiting is stale and dropped. True when
+    /// the agent went away and the thread is done.
+    fn on_run(&self, commands: &Receiver<AgentCommand>, session: &mut Session) -> bool {
+        let mut run = {
+            let definition = self.definition.lock().expect("mutex error");
+            match definition.state() {
+                // a clear asked for before this turn began was told it waits
+                // for the turn, so the turn runs first
+                AgentState::Working => true,
+                // a message the failed turn never took up is retried, unless
+                // a clear carries it into the next session instead
+                AgentState::Failed(_) => {
+                    !definition.clear_pending && !definition.message_queue.is_empty()
+                }
+                AgentState::Idle | AgentState::Configuring => false,
+            }
+        };
+
+        loop {
+            if run && self.run_turns(commands, session) {
+                return true;
+            }
+            if !self.definition.lock().expect("mutex error").clear_pending {
+                return false;
+            }
+            run = self.clear(session);
+        }
+    }
+
+    /// Ends the session and starts the next. True when the new session opens
+    /// with something to answer.
+    fn clear(&self, session: &mut Session) -> bool {
+        session.recorder.sync(&self.definition);
+
+        let (config, config_files, status) = {
+            let definition = self.definition.lock().expect("mutex error");
+            (
+                definition.config(),
+                definition.config_files(),
+                definition.memory_status.clone(),
+            )
+        };
+        let skills = config.memory().skills;
+        if let Err(err) = session.recorder.end(skills.is_some()) {
+            status.set(format!("ending the session failed: {}", err));
+        }
+        if let Some(id) = session.recorder.session_id() {
+            self.ended_sessions.lock().expect("mutex error").push(id);
+        }
+        if skills.is_some() {
+            if session.recorder.session_id().is_some() {
+                status.session_queued();
+            }
+            self.writer.enqueue(AgentJob {
+                dir: config.dir(),
+                skills,
+                status,
+            });
+        }
+        *session = self.new_session();
+
+        // reset and reopened under one lock, so the ui never draws the gap
+        let mut definition = self.definition.lock().expect("mutex error");
+        let mut carried = std::mem::take(&mut definition.message_queue);
+        carried.append(&mut definition.next_session_messages);
+        definition.messages.clear();
+        definition.usage = None;
+        let ended = std::mem::take(&mut definition.session_spend);
+        definition.past_sessions.merge(&ended);
+        definition.opened_with_directive = false;
+        definition.clear_pending = false;
+
+        let mut working = match &config_files {
+            Some(config_files) => begin_session(&mut definition, config_files),
+            None => false,
+        };
+        for message in carried {
+            definition.push_message(message);
+            working = true;
+        }
+        definition.set_state(if working {
+            AgentState::Working
+        } else {
+            AgentState::Idle
+        });
+        working
     }
 
     /// Loops while there are tool calls or queued messages to answer, up to
     /// `agent_max_iterations` requests. True when the agent went away mid turn
     /// and the thread is done.
-    fn run_turns(&self, commands: &Receiver<AgentCommand>, states: &mut ToolStates) -> bool {
+    fn run_turns(&self, commands: &Receiver<AgentCommand>, session: &mut Session) -> bool {
         let settings = {
             let definition = self.definition.lock().expect("mutex error");
             run_settings(&definition)
@@ -253,6 +448,7 @@ impl AgentInner {
                 chat_request(&definition, &settings)
             };
             iteration += 1;
+            session.recorder.sync(&self.definition);
 
             let result = self.openrouter.chat_completion(request);
 
@@ -266,6 +462,9 @@ impl AgentInner {
                         return false;
                     }
                     Ok(response) => {
+                        definition
+                            .session_spend
+                            .add_response(response.usage.as_ref());
                         if let Some(usage) = response.usage.clone() {
                             definition.set_usage(usage);
                         }
@@ -283,6 +482,8 @@ impl AgentInner {
                 }
             };
 
+            session.recorder.sync(&self.definition);
+
             match turn {
                 Turn::Failed(err) => {
                     self.definition
@@ -298,12 +499,21 @@ impl AgentInner {
                     iteration = 0;
                 }
                 Turn::Continue => {
+                    if !session.states.has_memory() {
+                        if let Ok(store) = session.recorder.store() {
+                            session.states.set_memory(store);
+                        }
+                    }
                     // no lock is held here: a tool call is a command running on
                     // this thread and can take as long as the command does,
                     // while the ui reads the definition every tick
                     let results: Vec<ToolResult> = tool_calls
                         .iter()
-                        .map(|call| settings.tools.dispatch(states, &settings.dir, call))
+                        .map(|call| {
+                            settings
+                                .tools
+                                .dispatch(&mut session.states, &settings.dir, call)
+                        })
                         .collect();
 
                     // every call the model made is answered, in the order it
@@ -315,6 +525,7 @@ impl AgentInner {
                         }
                         results.iter().any(|result| result.ends_turn())
                     };
+                    session.recorder.sync(&self.definition);
 
                     if ends_turn {
                         if self.finish_turn() {
@@ -350,6 +561,74 @@ fn shutting_down(commands: &Receiver<AgentCommand>) -> bool {
             Ok(AgentCommand::Shutdown) | Err(TryRecvError::Disconnected) => return true,
             Err(TryRecvError::Empty) => return false,
         }
+    }
+}
+
+const LOAD_FAILED: &str = "reading the memory totals failed";
+
+/// What the memory database holds from earlier processes.
+struct StoredTotals {
+    sessions: Spend,
+    memory: Spend,
+    skills: usize,
+    last_job: Option<MemoryJob>,
+    pending: usize,
+}
+
+/// A missing database holds nothing yet. `exclude` names sessions this
+/// process already counts; `owner` names this process.
+fn read_totals(dir: &Path, exclude: &[i64], owner: &str) -> Result<StoredTotals, StoreError> {
+    let Some(store) = MemoryStore::open_existing(&memory_path(dir))? else {
+        return Ok(StoredTotals {
+            sessions: Spend::default(),
+            memory: Spend::default(),
+            skills: 0,
+            last_job: None,
+            pending: 0,
+        });
+    };
+    Ok(StoredTotals {
+        sessions: store.session_totals(exclude)?,
+        memory: store.memory_totals(owner)?,
+        skills: store.count_skills()?,
+        last_job: store.last_job()?.map(|job| memory_job(job, owner)),
+        pending: store.pending_count()?,
+    })
+}
+
+/// A job still marked running by another process is one that process left
+/// behind when it stopped.
+fn memory_job(job: JobRecord, owner: &str) -> MemoryJob {
+    let state = match job.status {
+        JobStatus::Running if job.owner == owner => JobState::Running,
+        JobStatus::Running | JobStatus::Interrupted => JobState::Interrupted,
+        JobStatus::Done => JobState::Done { skills: job.skills },
+        JobStatus::Failed => JobState::Failed(job.error.unwrap_or_default()),
+    };
+    MemoryJob {
+        session_id: job.session_id,
+        state,
+        spend: job.spend,
+    }
+}
+
+/// What belongs to one session on the agent's thread: the tools' states and
+/// the recorder writing it down. Replaced whole when the session is cleared.
+struct Session {
+    states: ToolStates,
+    recorder: SessionRecorder,
+}
+
+/// Opens a session the way starting the agent does: the system prompt, then
+/// `DIRECTIVE.md` when there is one. True when the directive was pushed.
+fn begin_session(definition: &mut AgentDefinition, config_files: &ConfigFiles) -> bool {
+    definition.set_system_prompt(build_system_prompt(config_files));
+    match config_files.directive_file().contents() {
+        Some(directive) => {
+            definition.push_directive(directive.trim());
+            true
+        }
+        None => false,
     }
 }
 
@@ -430,6 +709,26 @@ pub struct AgentDefinition {
     /// Whether the first message came from `DIRECTIVE.md` rather than the user.
     opened_with_directive: bool,
     usage: Option<Usage>,
+    /// What the current session's chat has cost.
+    session_spend: Spend,
+    /// What every earlier session's chat cost, in this process and before it.
+    past_sessions: Spend,
+    /// Set by `/clear` until the agent's thread has started the new session.
+    clear_pending: bool,
+    /// What the user sent while a clear was pending; it opens the new session.
+    next_session_messages: Vec<Message>,
+    /// Shared with whatever works on the agent's memory, which updates it.
+    memory_status: MemoryStatus,
+}
+
+impl Messages for AgentDefinition {
+    fn messages(&self) -> &[Message] {
+        &self.messages
+    }
+
+    fn spend(&self) -> Spend {
+        self.session_spend
+    }
 }
 
 impl AgentDefinition {
@@ -471,6 +770,40 @@ impl AgentDefinition {
     }
     pub fn usage(&self) -> Option<Usage> {
         self.usage.clone()
+    }
+    /// True while a `/clear` waits for the turn in flight to end.
+    pub fn clear_pending(&self) -> bool {
+        self.clear_pending
+    }
+    /// What will open the session after the pending clear.
+    pub fn next_session_messages(&self) -> &[Message] {
+        &self.next_session_messages
+    }
+    /// What is happening to the agent's memory, when there is anything to say.
+    pub fn memory_status(&self) -> Option<String> {
+        self.memory_status.get()
+    }
+    /// Everything about the agent's memory, read at once.
+    pub fn memory_view(&self) -> MemoryView {
+        self.memory_status.snapshot()
+    }
+    /// What the current session's chat has cost. Reset by `/clear`.
+    pub fn session_spend(&self) -> Spend {
+        self.session_spend
+    }
+    /// What every session's chat has cost, the current one included.
+    pub fn all_sessions_spend(&self) -> Spend {
+        let mut total = self.past_sessions;
+        total.merge(&self.session_spend);
+        total
+    }
+    /// What analysing the agent's sessions has cost.
+    pub fn memory_spend(&self) -> Spend {
+        self.memory_status.snapshot().memory_spend()
+    }
+    /// The handle the memory status is written through.
+    pub fn memory_status_handle(&self) -> MemoryStatus {
+        self.memory_status.clone()
     }
 
     pub fn set_config(&mut self, config: AgentConfig) {

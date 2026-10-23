@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fmt::Debug,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -7,8 +8,11 @@ use std::{
 use thiserror::Error;
 
 use crate::core::config::config::Config;
+use crate::core::memory::recorder::MemoryStatus;
+use crate::core::memory::store::{memory_path, MemoryStore, SkillListing, StoreError};
+use crate::core::memory::writer::{process_token, AgentJob, MemoryWriter};
 use crate::core::openrouter::client::{OpenRouter, OpenRouterConfig, OpenRouterError};
-use crate::core::runtime::agent::{Agent, AgentDefinition, AgentError};
+use crate::core::runtime::agent::{Agent, AgentDefinition, AgentError, ClearOutcome};
 use crate::core::runtime::agent_config::AgentConfig;
 use crate::core::runtime::agent_config::{ConfigFiles, ConfigFilesError};
 use crate::core::runtime::tool_registry::{AgentTools, ToolRegistry};
@@ -29,8 +33,14 @@ pub enum RuntimeError {
     #[error("`{name}` could not be read: {error}")]
     ConfigFileUnreadable { name: String, error: String },
 
+    #[error("`{0}` has not started, so it has no session to clear")]
+    AgentNotStarted(String),
+
     #[error("openrouter error: {0}")]
     OpenRouter(#[from] OpenRouterError),
+
+    #[error("memory error: {0}")]
+    Memory(#[from] StoreError),
 }
 
 /// An agent's `config.json` is required, so every way of failing to read it
@@ -51,6 +61,8 @@ impl From<AgentError> for RuntimeError {
             AgentError::ConfigFileUnreadable { name, error } => {
                 RuntimeError::ConfigFileUnreadable { name, error }
             }
+            // the caller knows which agent it asked about and names it
+            AgentError::NotStarted => RuntimeError::AgentNotStarted(String::new()),
         }
     }
 }
@@ -62,6 +74,11 @@ pub struct Runtime {
     /// than on the agents: an agent is handed the tools its config came to,
     /// never the means of working them out.
     tools: Arc<ToolRegistry>,
+    /// Learns from every agent's ended sessions, one agent at a time.
+    writer: MemoryWriter,
+    /// The agents whose leftover sessions this process has already asked the
+    /// writer to recover, so a reload does not ask again.
+    recovered: Mutex<HashSet<PathBuf>>,
     inner: Arc<Mutex<RuntimeInner>>,
 }
 
@@ -120,11 +137,15 @@ impl Runtime {
         config: RuntimeConfig,
         tools: ToolRegistry,
     ) -> Result<Runtime, RuntimeError> {
-        let openrouter = OpenRouter::new(OpenRouterConfig::from_config(&config.config()))?;
+        let openrouter = Arc::new(OpenRouter::new(OpenRouterConfig::from_config(
+            &config.config(),
+        ))?);
 
         let runtime = Runtime {
             config,
-            openrouter: Arc::new(openrouter),
+            writer: MemoryWriter::start(Arc::clone(&openrouter), process_token()),
+            recovered: Mutex::new(HashSet::new()),
+            openrouter,
             tools: Arc::new(tools),
             inner: Arc::new(Mutex::new(RuntimeInner { agents: Vec::new() })),
         };
@@ -207,6 +228,7 @@ impl Runtime {
             .collect();
 
         let mut inner = self.inner.lock().expect("mutex error");
+        let mut recover = Vec::new();
 
         for (dir, loaded) in loaded {
             // an unusable config.json leaves the agent listed but unconfigured,
@@ -228,9 +250,12 @@ impl Runtime {
                 None => {
                     let name = Self::dir_name(&dir);
                     let config = AgentConfig::empty().set_name(name.clone()).set_dir(dir);
-                    inner
-                        .agents
-                        .push(Agent::new(name, config, Arc::clone(&self.openrouter)));
+                    inner.agents.push(Agent::new(
+                        name,
+                        config,
+                        Arc::clone(&self.openrouter),
+                        self.writer.handle(),
+                    ));
                     inner.agents.len() - 1
                 }
             };
@@ -239,8 +264,13 @@ impl Runtime {
             match loaded {
                 Ok((config_files, tools)) => {
                     let config = definition.config().set_from_config_files(&config_files);
-                    definition.set_config(config);
+                    definition.set_config(config.clone());
                     definition.set_config_files(config_files, tools);
+                    recover.push(AgentJob {
+                        dir: config.dir(),
+                        skills: config.memory().skills,
+                        status: definition.memory_status_handle(),
+                    });
                 }
                 Err(err) => {
                     // the settings came out of the file that just failed to load
@@ -251,9 +281,25 @@ impl Runtime {
             }
         }
 
+        self.recover_sessions(recover);
+
         inner
             .agents
             .sort_by_key(|agent| agent.agent_definition().config().name());
+    }
+
+    /// Asks the writer to tidy up after earlier processes, once per agent per
+    /// process. An agent whose config cannot be read is left alone, so a typo
+    /// never decides whether its old sessions are analysed.
+    fn recover_sessions(&self, jobs: Vec<AgentJob>) {
+        let mut recovered = self.recovered.lock().expect("mutex error");
+        for job in jobs {
+            if !memory_path(&job.dir).is_file() || recovered.contains(&job.dir) {
+                continue;
+            }
+            recovered.insert(job.dir.clone());
+            self.writer.handle().enqueue(job);
+        }
     }
 
     /// Refused once the agent has started: its tools and their states were
@@ -299,6 +345,51 @@ impl Runtime {
         let inner = self.inner.lock().expect("mutex error");
         inner.agent(id)?.send_message(content);
         Ok(())
+    }
+
+    /// Ends the agent's session and starts a new one. Mid turn the clear is
+    /// queued until the turn ends.
+    pub fn clear_agent_session(&self, id: &str) -> Result<ClearOutcome, RuntimeError> {
+        let inner = self.inner.lock().expect("mutex error");
+        inner.agent(id)?.clear_session().map_err(|err| match err {
+            AgentError::NotStarted => RuntimeError::AgentNotStarted(id.to_string()),
+            err => err.into(),
+        })
+    }
+
+    /// Every skill in the agent's memory database, newest first. Works whether
+    /// or not the agent has started; no database means no skills.
+    pub fn agent_skills(&self, id: &str) -> Result<Vec<SkillListing>, RuntimeError> {
+        match self.agent_store(id)? {
+            Some((store, _)) => Ok(store.skills()?),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Permanently deletes one of the agent's skills and recounts them for the
+    /// ui. False when it was already gone.
+    pub fn delete_agent_skill(&self, id: &str, skill_id: i64) -> Result<bool, RuntimeError> {
+        let Some((store, status)) = self.agent_store(id)? else {
+            return Ok(false);
+        };
+        let deleted = store.delete_skill(skill_id)?;
+        status.set_skills(store.count_skills()?);
+        Ok(deleted)
+    }
+
+    /// The agent's memory database, if it has one. Read under the lock, which
+    /// is let go before the database is opened.
+    fn agent_store(&self, id: &str) -> Result<Option<(MemoryStore, MemoryStatus)>, RuntimeError> {
+        let (dir, status) = {
+            let inner = self.inner.lock().expect("mutex error");
+            let definition = inner.agent(id)?.agent_definition();
+            (definition.config().dir(), definition.memory_status_handle())
+        };
+        // an unset directory would otherwise resolve against the working one
+        if dir.as_os_str().is_empty() {
+            return Ok(None);
+        }
+        Ok(MemoryStore::open_existing(&memory_path(&dir))?.map(|store| (store, status)))
     }
 
     /// The directories in the project directory an agent is loaded from.

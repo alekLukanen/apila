@@ -15,8 +15,10 @@ apila_test_agents/
       config.json
       AGENTS.md
       DIRECTIVE.md // (optional)
+      SKILL_MEMORY.md // (optional)
    config.json
    SYSTEM.md
+   SKILL_MEMORY.md // (optional)
 ```
 
 The base `config.json` should look like this
@@ -60,6 +62,110 @@ default for either.
 * `tools.configs` carries each tool's own settings. Nothing outside the tool
   reads them, so a tool can add a setting without this file's shape changing. A
   config for a tool that is not enabled is ignored.
+* `memory` is optional and switches on what the agent learns from its past
+  sessions. See [Memory](#memory).
+
+## Sessions
+
+A session lasts from starting an agent until you type `/clear` in its chat and
+press Enter. `/clear` ends the session and starts a new one the way starting
+the agent does: on its `DIRECTIVE.md` if it has one, otherwise waiting for your
+first message. If the agent is in the middle of a turn, the clear is queued and
+runs when the turn ends; anything you send after a queued `/clear` opens the
+new session.
+
+Every agent's sessions are recorded as they happen in
+`<agent_dir>/memory/memory.db`, whether or not memory is configured.
+
+## Memory
+
+With `memory.skills` enabled, an agent turns its finished sessions into skills
+(markdown notes on procedures that worked) and can search them in later
+sessions.
+
+```
+{
+  "model": "anthropic/claude-sonnet-5.5",
+  "agent_max_iterations": 20,
+  "tools": { "enabled": ["sqlite"] },
+  "memory": {
+    "skills": {
+      "enabled": true,
+      "embedding_model": "openai/text-embedding-3-small",
+      "min_similarity": 0.25,
+      "writer_model": "anthropic/claude-haiku-4.5",
+      "writer_max_iterations": 8
+    }
+  }
+}
+```
+
+* `enabled` defaults to `false`. When it is `true`, `embedding_model` and
+  `writer_max_iterations` are required.
+* `embedding_model` is the OpenRouter embedding model skills are searched with.
+  A skill is embedded as its name and its `when_to_use`, so changing the model
+  leaves skills saved under the old one out of searches.
+* `min_similarity` (default 0.25, between -1 and 1) is how similar a skill has
+  to be to a request for `search_skills` to return it.
+* `writer_model` is the model that writes the skills. It defaults to the
+  agent's own model; a cheaper one works well.
+* `writer_max_iterations` is the most requests the writer may make while
+  analysing one session.
+
+When a session ends with `/clear`, a background writer reads its transcript and
+saves up to three skills from it, updating an existing skill rather than
+duplicating it. A session left open when apila closed is analysed the next time
+apila starts. A session that fails to be analysed is retried, up to three times
+in all. Sessions that end while skills are disabled are kept but never analysed.
+
+A `SKILL_MEMORY.md` tells the writer what to save and how to write each skill's
+body, in place of its default (procedures that worked, written as `## Steps`,
+`## Artifacts` and `## Pitfalls`). It is looked up in the agent's directory,
+then in the project directory, and read when the agent's config is loaded. The
+writer's limits and safety rules still apply. An empty file counts as none; one
+that cannot be read or is larger than 16 KiB stops the agent being configured.
+
+Enabling skills gives the agent two tools, which are not listed in
+`tools.enabled`:
+
+* `search_skills` takes a `request` and an optional `limit` (default 5, at most
+  20) and lists the id, name, similarity and `when_to_use` of each skill at or
+  above `min_similarity`.
+* `get_skill` takes an `id` and returns the whole skill.
+
+### Memory and costs in the ui
+
+Under an agent's `State:` line, `Memory:` shows how many skills it has and how
+many sessions are being or waiting to be analysed, and `Last job:` shows the
+newest analysis: its session, how it went, and the tokens and dollars it used.
+After a failed analysis the remaining sessions wait for the next `/clear`.
+
+Each agent in the list shows three costs: `sess` for the current session (reset
+by `/clear`), `all` for every session including the current one, and `mem` for
+every analysis of its sessions. Costs come from the `usage.cost` OpenRouter
+reports with each response; with your own provider key (BYOK) that is only
+OpenRouter's fee. A `~` marks a total some responses came back without a cost
+for, and `—` one where none had a cost. The `all` and `mem` totals are kept in
+the agent's `memory/memory.db`, so deleting that file resets them. The
+embeddings `search_skills` makes are not counted.
+
+#### Viewing memories
+
+Under the configuration, the detail window has two tabs: `Setup` (or `Session`
+once the agent runs) and `Memories (N)`. `<Tab>` switches between them from the
+agent list, steps from the chat into the memories, and goes back again with the
+chat's draft kept. The tab you pick stays put as you move between agents, and
+it works for any agent with a `memory/memory.db`, whether it has started or
+not and whether skills are on.
+
+On the Memories tab, `<Enter>` browses the skills without starting the agent.
+The list shows each skill's name, `when_to_use` and how long ago it was
+updated; the reader beside it shows the updated time in local time and the
+skill's body rendered as markdown. `↑/↓` pick a skill, `<PgUp/PgDn>` and the
+wheel over the reader scroll it, `<R>` reloads and `<Esc>` goes back to the
+list. `<D>` then `y` deletes the selected skill permanently; any other key
+cancels. The writer may save a deleted skill again if a later session teaches
+it the same thing.
 
 ## Tools
 
@@ -67,12 +173,19 @@ default for either.
 | --- | --- | --- |
 | `end_turn` | always | none |
 | `bash` | `"enabled": ["bash"]` | `bash_timeout`, in seconds (default 120) |
-| `sqlite` | `"enabled": ["sqlite"]` | `max_databases` open at once (default 8), `max_rows` returned per query (default 100), `sqlite_timeout` per call, in seconds (default 30) |
+| `sqlite` | `"enabled": ["sqlite"]` | `max_databases` saved at once (default 8), `max_rows` returned per query (default 100), `sqlite_timeout` per call, in seconds (default 30) |
 | `fetch_webpage` | `"enabled": ["fetch_webpage"]` | `fetch_timeout`, in seconds (default 30), `max_page_bytes` saved per page (default 10 MiB), `allow_private_hosts` (default false), `use_proxy` to honour `HTTP_PROXY`/`HTTPS_PROXY` (default false; through a proxy only literal private addresses are refused) |
 | `read_webpage_data` | `"enabled": ["read_webpage_data"]` | `max_lines` returned per call (default 500) |
+| `search_skills`, `get_skill` | `memory.skills` (see [Memory](#memory)) | none of their own |
 
 `sqlite` gives an agent sqlite databases (via the `turso` crate) that it can
-create, drop, list, inspect, write to and query. They last for the session: they
-are held in memory by the agent that created them, never written to disk, and
-gone when apila exits. Every call runs in a transaction of its own and is undone
-completely if any part of it fails or it runs past `sqlite_timeout`.
+create, drop, list, inspect, write to and query. Each one is saved at
+`<agent_dir>/databases/<name>.db` and is still there in later sessions and
+after apila restarts, until the agent drops it. `max_databases` counts every
+saved database. Every call runs in a transaction of its own and is undone
+completely if any part of it fails or it runs past `sqlite_timeout`. `ATTACH`,
+`DETACH` and `VACUUM INTO` are refused.
+
+Only one apila process can use a project's saved databases and memory at a
+time; a second one reports that the database is in use by another apila
+process.

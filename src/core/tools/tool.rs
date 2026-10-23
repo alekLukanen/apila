@@ -2,9 +2,12 @@ use std::any::Any;
 use std::cell::Cell;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
-use std::sync::Once;
+use std::sync::{Arc, Once};
 
 use thiserror::Error;
+
+use crate::core::memory::store::MemoryStore;
+use crate::core::openrouter::client::OpenRouter;
 
 /// Shared by every agent thread, so it holds nothing that belongs to one
 /// agent; that lives in the [`ToolState`] it hands out.
@@ -59,11 +62,18 @@ pub trait ToolState: Send {
 pub struct ToolContext {
     dir: PathBuf,
     config: serde_json::Value,
+    openrouter: Option<Arc<OpenRouter>>,
+    memory: Option<Arc<MemoryStore>>,
 }
 
 impl ToolContext {
     pub fn new(dir: PathBuf, config: serde_json::Value) -> ToolContext {
-        ToolContext { dir, config }
+        ToolContext {
+            dir,
+            config,
+            openrouter: None,
+            memory: None,
+        }
     }
     /// The agent's own directory. Everything a tool touches on disk is relative
     /// to it; an agent never works in another agent's directory.
@@ -75,6 +85,23 @@ impl ToolContext {
     /// out of it rather than reading keys one at a time.
     pub fn config(&self) -> serde_json::Value {
         self.config.clone()
+    }
+    /// The client the agent talks to the model through, for a tool that needs
+    /// a model of its own. Absent where nothing set one, as in most tests.
+    pub fn openrouter(&self) -> Option<Arc<OpenRouter>> {
+        self.openrouter.clone()
+    }
+    /// The agent's memory database, when it could be opened.
+    pub fn memory(&self) -> Option<Arc<MemoryStore>> {
+        self.memory.clone()
+    }
+    pub fn set_openrouter(mut self, openrouter: Option<Arc<OpenRouter>>) -> ToolContext {
+        self.openrouter = openrouter;
+        self
+    }
+    pub fn set_memory(mut self, memory: Option<Arc<MemoryStore>>) -> ToolContext {
+        self.memory = memory;
+        self
     }
     pub fn set_dir(mut self, dir: PathBuf) -> ToolContext {
         self.dir = dir;
@@ -154,11 +181,10 @@ pub fn required_string<'a>(
     arguments: &'a serde_json::Value,
     argument: &str,
 ) -> Result<&'a str, ToolError> {
-    let value = optional_string(arguments, argument)?.ok_or_else(|| {
-        ToolError::MissingArgument {
+    let value =
+        optional_string(arguments, argument)?.ok_or_else(|| ToolError::MissingArgument {
             argument: argument.into(),
-        }
-    })?;
+        })?;
     if value.trim().is_empty() {
         return Err(ToolError::InvalidArgument {
             argument: argument.into(),
